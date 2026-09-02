@@ -34,5 +34,11 @@
  * For more details, see https://docs.gradle.org/8.0.1/userguide/java_library_plugin.html#sec:java_library_configurations_graph
  */
 dependencies {
-    //runtimeOnlyNonPublishable("com.github.GTNewHorizons:NotEnoughItems:2.7.69-GTNH:dev")
+    // ProjectE 1.7.10 GTNH fork(本地 jar,编译期 + 运行期;必需)
+    devOnlyNonPublishable(rfg.deobf(project.files("libs/ProjectE-1.7.10-PE1.10.1.jar")))
+    // GregTech GTNH 2.8.4(本地 jar,编译期 + 运行期;软依赖,无 GT 时自动退化为 工作台+冶炼)
+    devOnlyNonPublishable(rfg.deobf(project.files("libs/gregtech-5.09.51.482.jar")))
+    // NEI-RecipeTree + NEI(GTNH fork):仅客户端 /projecte_autoemc 对齐配方树用,运行时软依赖
+    devOnlyNonPublishable(rfg.deobf(project.files("libs/neirecipetree-0.0.5.jar")))
+    devOnlyNonPublishable(rfg.deobf(project.files("libs/NotEnoughItems-2.8.44-GTNH.jar")))
 }
