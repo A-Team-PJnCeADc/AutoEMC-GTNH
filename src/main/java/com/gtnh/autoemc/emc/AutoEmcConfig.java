@@ -17,7 +17,7 @@ public final class AutoEmcConfig {
     public static boolean enabled = true;
     /** 无价物品按 0 计 */
     public static boolean unpricedIsZero = true;
-    /** 蒸汽机可处理配方的 EU/t 上限:低于等于它且 map 在蒸汽名单内 → 按"蒸汽时代"计 */
+    /** 蒸汽机可处理配方的 EU/t 上限:低于等于它且 map 在蒸汽名单内 -> 按"蒸汽时代"计 */
     public static int steamMaxEUt = 30;
     /** 多方块结构独占的 RecipeMap(unlocalizedName 列表) */
     public static final Set<String> multiMaps = new HashSet<>();

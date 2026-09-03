@@ -36,7 +36,7 @@ import moze_intel.projecte.network.PacketHandler;
  * 客户端与服务器在同一 JVM,共享 ProjectE 的 EMCMapper.emc 静态表。玩家登录时 PE
  * ConnectionHandler 补发全量 EMC,客户端线程在 SyncEmcPKT.Handler 里 clear/重建这张表
  * 并 cacheFullKnowledge 迭代它;若 map#2(clearMaps + map,Server 线程,结构性写同一张表)
- * 落在玩家登录之后,两线程并发改同一 LinkedHashMap → ConcurrentModificationException →
+ * 落在玩家登录之后,两线程并发改同一 LinkedHashMap -> ConcurrentModificationException ->
  * "fatal error during network handshake" 崩连接(实测:cache miss 全量重算 ~3s,原
  * "下一 tick 应用"恰好撞上登录同步窗口)。FMLServerStartedEvent 在玩家登录之前触发,
  * 同步做完天然无竞态;玩家登录后由 PE 自己的 login 补发拿到最终映射。代价只是
@@ -85,11 +85,14 @@ public final class EmcRunner {
             LOG.error("ProjectE EMC proxy unavailable, AutoEMC aborted.");
             return;
         }
+        // 神秘时代要素/源质 EMC(规则:6 元始=256,复合=子要素递归相加);写 Registry(ASPECT 类型)
+        // 并镜像到 PE 侧类型表 —— 需在 Server 线程、EMCMapper 类已初始化(clinit)后执行。
+        AspectSeeder.seed();
         net.minecraft.server.MinecraftServer srv = net.minecraft.server.MinecraftServer.getServer();
         boolean dedicated = srv != null && srv.isDedicatedServer();
         if (!dedicated) {
             // 单机集成服务器:客户端同 JVM 共享 EMCMapper.emc,登录 EMC 同步包(客户端线程)与
-            // map#2(Server 线程)并发改表会 CME 崩连接 → 在玩家登录前同步做完 compute + apply。
+            // map#2(Server 线程)并发改表会 CME 崩连接 -> 在玩家登录前同步做完 compute + apply。
             try {
                 PendingResult r = computeAndPublish(proxy);
                 if (r != null) {
@@ -99,7 +102,7 @@ public final class EmcRunner {
                 LOG.error("AutoEMC compute/apply failed:", t);
             }
         } else {
-            // 专用服务器:无共享静态表竞态 → 后台线程算(不阻塞启动),Server tick 应用。
+            // 专用服务器:无共享静态表竞态 -> 后台线程算(不阻塞启动),Server tick 应用。
             Thread worker = new Thread(() -> {
                 try {
                     pending = computeAndPublish(proxy);
@@ -158,7 +161,51 @@ public final class EmcRunner {
             stats.gtSkippedNoOutput,
             stats.gtSkippedRecycle,
             stats.gtToolSlots);
+        if (stats.alRecipes > 0 || stats.alSkipped > 0) {
+            // 装配线配方在 RecipeMap 之外(数据棒注册表),单独报告
+            LOG.info("Assembly line recipes: registered={} (skipped={})", stats.alRecipes, stats.alSkipped);
+        }
+        if (stats.avRecipes > 0 || stats.avSkipped > 0) {
+            // Avaritia 大工作台配方独立注册表,单独报告
+            LOG.info("Avaritia extreme-crafting recipes: registered={} (skipped={})", stats.avRecipes, stats.avSkipped);
+        }
+        String skippedBreakdown = stats.topSkippedUnknownClasses(15);
+        if (!skippedBreakdown.isEmpty()) {
+            // 定位"哪个 mod 的哪类自定义 IRecipe 没被识别/解析":按配方类名聚合的跳过明细
+            // (总量 == 上一行的 unknown=;若干条后是驱动 RecipeCollector.register() 新源的依据)
+            LOG.info("Crafting skipped-unknown breakdown by recipe class: {}", skippedBreakdown);
+        }
+        // 隔离层跳过的配方(异常类,非内容性):内容性跳过已经体现在上面的计数里,这些是
+        // 畸形数据/API 漂移导致的单配方失败 —— 详情见各 RecipeScan error 日志(带 map/槽位/输出)
+        int isolationErrors = stats.craftingSkippedError + stats.craftingSkippedIngredient
+            + stats.smeltSkippedError
+            + stats.gtSkippedError
+            + stats.alSkippedError
+            + stats.avSkippedError;
+        if (isolationErrors > 0) {
+            LOG.warn(
+                "Recipe scan isolation errors (recipes skipped): craftingRecipe={}, craftingIngredient={}, smelting={}, gt={}, assemblyline={}, avaritia={}",
+                stats.craftingSkippedError,
+                stats.craftingSkippedIngredient,
+                stats.smeltSkippedError,
+                stats.gtSkippedError,
+                stats.alSkippedError,
+                stats.avSkippedError);
+        }
         LOG.info("Producer targets: {}", producers.size());
+
+        // 流体反推产者表:零物品输出、单一流体输出的 GT 配方(给无材料锭的流体按配方成本定价);
+        // 计数入 stats -> 并入指纹(gt 源 fingerprintLines 的 fluidrecs= 行),产者集合变化即重算。
+        Map<String, List<FluidProducer>> fluidProducers = new HashMap<>();
+        if (GtMachines.available()) {
+            GtMachines.collectFluidProducers(fluidProducers, stats);
+            if (stats.gtFluidRecipes > 0) {
+                LOG.info(
+                    "Fluid producers (fluid-only recipes, for reverse pricing): {} producers for {} fluids",
+                    stats.gtFluidRecipes,
+                    fluidProducers.size());
+            }
+        }
 
         String fingerprint = ValueStore.computeFingerprint(stats);
         File cacheFile = AutoEmcConfig.getCacheFile();
@@ -170,7 +217,7 @@ public final class EmcRunner {
         Map<ItemKey, List<Pick>> persistedChains = AutoEmcConfig.cacheJson ? ValueStore.loadChains(cacheFile)
             : new HashMap<>();
         // 旧规则时代存下的链可能把"工具/一次性物品"当材料输入(如 ggfab 单次工具/GT 工具),
-        // 新鲜求值绝不会产生这类子节点 → 加载即清洗,防止 /view 树里展开工具。
+        // 新鲜求值绝不会产生这类子节点 -> 加载即清洗,防止 /view 树里展开工具。
         int prunedPersisted = pruneToolChildren(persistedChains);
         if (prunedPersisted > 0) {
             LOG.info(
@@ -179,7 +226,7 @@ public final class EmcRunner {
                 persistedChains.size());
         }
         if (cacheOk && !cached.isEmpty() && persistedChains.isEmpty()) {
-            // 旧缓存升级:有值但链从未保存(schema 1 无 chains 段)→ 本次放弃预载,
+            // 旧缓存升级:有值但链从未保存(schema 1 无 chains 段)-> 本次放弃预载,
             // 全量求值一次把链建全;否则 preload 短路求值,链永远为空。
             LOG.info("Cache has {} values but no chain data (legacy upgrade): full re-evaluation.", cached.size());
             cacheOk = false;
@@ -191,7 +238,7 @@ public final class EmcRunner {
             cached.size(),
             fingerprint);
 
-        EmcEngine engine = new EmcEngine(producers, proxy);
+        EmcEngine engine = new EmcEngine(producers, fluidProducers, proxy);
         engine.preload(cached);
 
         // GTMoreEMC 移植:GT 材料形态直接按 质量×72×形态系数 定价(命中即定,不再走配方图;
@@ -233,7 +280,7 @@ public final class EmcRunner {
         // 同等级电路板统一价(规则:任意电路板 = 同等级总价/数量,含真实板的覆盖)
         int tierChanged = engine.uniformCircuitBoardTiers();
 
-        // 一致性重估:本次运行只要有 0→有价 的变化(假电路板扫尾定价、延迟修正 sticky-0、
+        // 一致性重估:本次运行只要有 0->有价 的变化(假电路板扫尾定价、延迟修正 sticky-0、
         // 电路板同级统一),就可能存在按旧值(0)算过并滞留无价 pick 的依赖方 —— 例如求值时
         // 某槽所有透镜都还没价,0 透镜被当免费选中、成本记 0;等透镜定价后该产品值偏低、
         // /view 里还显示无价透镜。清空除规则叶子外的估值重算一遍,让它们在最终价上重选配方。
@@ -246,6 +293,18 @@ public final class EmcRunner {
                 deferredFixed,
                 tierChanged,
                 recomputed);
+        }
+
+        // 流体第二遍(cache-miss 全量求值):第一遍物品求值时流体价值可能尚未解析(环/顺序依赖)
+        // 或锚未定价,导致吃流体的配方候选失效/被当免费压价。清空重跑后,已解析的流体价值
+        // (材料流体 144L=锭价、无锭按产者配方反推)参与最终选择;电路板同级统一价顺带重做一次。
+        if (!cacheOk && (stats.gtFluidRecipes > 0 || stats.gtRecipesWithFluid > 0)) {
+            int fluidRecomputed = engine.fluidRecompute();
+            engine.uniformCircuitBoardTiers();
+            LOG.info(
+                "Fluid-cost second pass (fluid inputs now valued): recomputed {} item values; {} fluid values resolved.",
+                fluidRecomputed,
+                engine.fluidValueCount());
         }
 
         Map<ItemKey, Integer> finalValues = engine.collectFinalValues();
@@ -278,7 +337,7 @@ public final class EmcRunner {
             LOG.info("Pruned {} tool children from merged chains.", prunedMerged);
         }
         // 规则叶子(质量种子形态 / 同级平均电路板)没有配方输入:旧规则时代存下的机器配方链已过期,
-        // 保留会让 /view 继续展开已经被种子/平均价定死价的形态 → 剔除,避免树里出现与价格来源矛盾的展开。
+        // 保留会让 /view 继续展开已经被种子/平均价定死价的形态 -> 剔除,避免树里出现与价格来源矛盾的展开。
         int prunedLeafChains = 0;
         Iterator<Map.Entry<ItemKey, List<Pick>>> cit = mergedChains.entrySet()
             .iterator();
@@ -320,7 +379,7 @@ public final class EmcRunner {
             // LoaderState PRE/INITIALIZATION/POSTINITIALIZATION(mod 加载期)注册,serverStarted
             // 阶段调用会抛 IllegalStateException("tried to register EMC at an invalid time")。
             // 直调 APICustomEMCMapper.instance(public,无 loader-state 门禁):值写入内存表,
-            // 由下方 map#2 的 addMappings 消费(activeModContainer 为 null → "unknown mod",
+            // 由下方 map#2 的 addMappings 消费(activeModContainer 为 null -> "unknown mod",
             // 走 modlessCustomEMCPriority,默认 1,0 禁用)。
             for (Map.Entry<ItemKey, Integer> e : r.finalValues.entrySet()) {
                 APICustomEMCMapper.instance.registerCustomEMC(

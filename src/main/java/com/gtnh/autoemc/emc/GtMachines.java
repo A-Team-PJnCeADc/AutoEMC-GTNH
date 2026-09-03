@@ -16,6 +16,8 @@ import net.minecraftforge.oredict.OreDictionary;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import com.gtnh.autoemc.api.recipe.RecipeScan;
+
 import gregtech.api.enums.ItemList;
 import gregtech.api.enums.Materials;
 import gregtech.api.enums.OrePrefixes;
@@ -147,7 +149,7 @@ public final class GtMachines {
      * GT 材料"份量"折算:小撮粉/小堆粉/粒 等没有产出配方(主要靠副产),但它们与同材料的
      * 粉/锭存在固定份量比(如 dustTiny = dust/9、dustSmall = dust/4、nugget = ingot/9)。
      * 无配方物品求值时若可折算到同材料基准份,则按份量比计价 —— 否则能量水晶这类
-     * "粉→小撮粉→…"的链会在小撮粉处断掉。
+     * "粉->小撮粉->…"的链会在小撮粉处断掉。
      * 返回 0 = 不可折算(非 GT 材料/无基准份/基准份无价)。
      */
     public static int materialFractionValue(ItemKey key, EmcEngine engine, Deque<ItemKey> stack) {
@@ -242,7 +244,7 @@ public final class GtMachines {
     /**
      * key 是否为透镜类物品:①prefix = lens 的 GT 材料透镜;②任一 oredict 名含 lens
      * (craftingLens*、lensGlass 等);③注册名含 lens(GT 固定件透镜等没挂材料关联的,
-     * 如激光蚀刻机用的玻璃透镜类物品)。三者满足其一即按透镜处理(车床板→透镜偏好、
+     * 如激光蚀刻机用的玻璃透镜类物品)。三者满足其一即按透镜处理(车床板->透镜偏好、
      * 配方选择时有价透镜优先)。
      */
     public static boolean isLensKey(ItemKey key) {
@@ -269,7 +271,7 @@ public final class GtMachines {
         }
     }
 
-    /** 是否为车床板→透镜配方:来源含 lathe 且输入槽里含板(plate)形态的选项 */
+    /** 是否为车床板->透镜配方:来源含 lathe 且输入槽里含板(plate)形态的选项 */
     public static boolean isLathePlateToLens(EmcRecipe r) {
         if (r == null || r.source == null
             || !r.source.toLowerCase()
@@ -371,7 +373,7 @@ public final class GtMachines {
         }
     }
 
-    /** mEUt → 电压等级索引(0=ULV,1=LV,...);超出上限返回最后一个索引+1 */
+    /** mEUt -> 电压等级索引(0=ULV,1=LV,...);超出上限返回最后一个索引+1 */
     private static int voltageRankOf(int eut) {
         ensureTierCaps();
         for (int i = 0; i < recipeEUtCaps.length; i++) {
@@ -385,6 +387,12 @@ public final class GtMachines {
     /**
      * 遍历 RecipeMap.ALL_RECIPE_MAPS,把每张 map 里可用的产出配方登记成生产者。
      * 只取主输出(mOutputs[0],数量=stackSize),副产物/概率产物不计入成本归属。
+     *
+     * <p>
+     * recipe 级隔离:单条配方处理抛异常(畸形配方数据、附属 mod 注册异常、换 GTNH 版本后
+     * GT API 漂移等)只丢这一条并计数(gtSkippedError),该 map 其余配方与后续 map 照常。
+     * 坏配方不计入 mapCount -> fingerprint 反映"实际登记集",若坏配方稳定复现,每次运行
+     * 都在同一点失败 -> 指纹稳定且与登记集一致,不会命中含坏配方的旧缓存(静默错值)。
      */
     public static void collect(Map<ItemKey, List<EmcRecipe>> producers, EmcStats stats) {
         if (!available()) {
@@ -396,123 +404,434 @@ public final class GtMachines {
             String mapName = map.unlocalizedName;
             int category = AutoEmcConfig.multiMaps.contains(mapName) ? EmcRecipe.CAT_MULTI : EmcRecipe.CAT_SINGLE;
             boolean steamCapable = AutoEmcConfig.steamMaps.contains(mapName);
-            int mapCount = 0;
 
-            for (GTRecipe r : new ArrayList<>(map.getAllRecipes())) {
-                if (r == null) {
+            RecipeScan.Result res = RecipeScan.forEachRecipe(
+                "gt",
+                mapName,
+                new ArrayList<>(map.getAllRecipes()),
+                r -> outDesc(r),
+                r -> collectOne(mapName, category, steamCapable, r, producers, stats));
+            stats.gtSkippedError += res.errors;
+            stats.gtMapRecipeCounts.put(mapName, res.handled);
+        }
+        stats.gtMaps = RecipeMap.ALL_RECIPE_MAPS.size();
+    }
+
+    /**
+     * 单条 GT 配方 -> 是否登记为产出者。各类内容性跳过(disabled/隐藏/回收/概率/通配等)在
+     * 内部计数并返回 false;抛异常 = 该配方意外失败,由 collect 里的 RecipeScan 隔离跳过。
+     */
+    private static boolean collectOne(String mapName, int category, boolean steamCapable, GTRecipe r,
+        Map<ItemKey, List<EmcRecipe>> producers, EmcStats stats) {
+        if (r == null) {
+            return false;
+        }
+        if (!r.mEnabled || r.mFakeRecipe) {
+            stats.gtSkippedDisabled++;
+            return false;
+        }
+        if (r.mHidden && !AutoEmcConfig.includeHiddenRecipes) {
+            stats.gtSkippedDisabled++;
+            return false;
+        }
+        // 回收类配方不参与定价:GT 用 RECYCLE 元数据 + "*_recycling" 分类标记
+        // (逆向粉碎/逆向冶炼/电弧炉回收,即把成品/材料打回粉末或锭,会形成环或低估价值)。
+        if (r.getMetadataOrDefault(GTRecipeConstants.RECYCLE, false)) {
+            stats.gtSkippedRecycle++;
+            return false;
+        }
+        RecipeCategory rc = r.getRecipeCategory();
+        if (rc != null && rc.unlocalizedName.contains("recycling")) {
+            stats.gtSkippedRecycle++;
+            return false;
+        }
+        boolean hasFluidInput = r.mFluidInputs != null && r.mFluidInputs.length > 0;
+        if (hasFluidInput) {
+            // 流体不参与计价,配方仍有效
+            stats.gtRecipesWithFluid++;
+        }
+        if (r.mOutputs == null || r.mOutputs.length == 0 || r.mOutputs[0] == null) {
+            stats.gtSkippedNoOutput++;
+            return false;
+        }
+        boolean hasItemInput = r.mInputs != null && r.mInputs.length > 0;
+        if (!hasItemInput && !hasFluidInput) {
+            // 无任何输入的"凭空产出"(如创造类)不算配方
+            stats.gtSkippedNoOutput++;
+            return false;
+        }
+        if (r.mChances != null && r.mChances.length > 0 && r.mChances[0] < 10000) {
+            // 主输出带概率 -> 不可靠的产出者,跳过
+            stats.gtSkippedChance++;
+            return false;
+        }
+
+        ItemStack out = r.mOutputs[0];
+        if (out.getItem() == null || out.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+            stats.gtSkippedWildcard++;
+            return false;
+        }
+        ItemKey outKey = ItemKey.of(out);
+        int outQty = Math.max(1, out.stackSize);
+
+        int tier;
+        if (steamCapable && r.mEUt <= AutoEmcConfig.steamMaxEUt) {
+            // 蒸汽时代就能做 -> 不选 LV
+            tier = EmcRecipe.TIER_STEAM;
+        } else {
+            tier = voltageRankOf(r.mEUt);
+        }
+
+        // 只把"物品输入"算进成本;流体输入忽略
+        List<EmcIngredient> inputs = new ArrayList<>();
+        boolean bad = false;
+        if (hasItemInput) {
+            for (ItemStack in : r.mInputs) {
+                if (in == null || in.getItem() == null) {
+                    stats.gtSkippedNoOutput++;
+                    bad = true;
+                    break;
+                }
+                if (in.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+                    stats.gtSkippedWildcard++;
+                    bad = true;
+                    break;
+                }
+                if (isOneTimeItem(in)) {
+                    // 一次性物品(编程电路、ggfab 工具/模具/铸模):不消耗,不参与计价也不展开
+                    stats.gtToolSlots++;
                     continue;
                 }
-                if (!r.mEnabled || r.mFakeRecipe) {
-                    stats.gtSkippedDisabled++;
+                inputs.add(EmcIngredient.fixed(ItemKey.of(in), Math.max(1, in.stackSize)));
+            }
+        }
+        if (bad) {
+            return false;
+        }
+        // 纯流体输入配方(inputs 为空)-> 材料成本为 0,仍登记为产出者
+
+        // 输入形态等级:取所有输入选项里最"锚定"的(锭/宝石>粉>小堆粉/粒>小撮粉>矿石),
+        // 用于"粉末优先锭粉碎、粉末合成粉末优先用最大粉末"。
+        int formRank = 3;
+        for (EmcIngredient ing : inputs) {
+            for (ItemKey opt : ing.options) {
+                formRank = Math.max(formRank, formRank(opt.toStack()));
+            }
+        }
+
+        // 流体输入总量(L):"合成路径液体少"优先,越少越优先
+        int fluidAmount = 0;
+        if (r.mFluidInputs != null) {
+            for (FluidStack f : r.mFluidInputs) {
+                if (f != null) {
+                    fluidAmount += f.amount;
+                }
+            }
+        }
+
+        producers.computeIfAbsent(outKey, k -> new ArrayList<>())
+            .add(
+                new EmcRecipe(
+                    outKey,
+                    outQty,
+                    inputs,
+                    category,
+                    tier,
+                    mapName,
+                    formRank,
+                    fluidAmount,
+                    fluidUses(r.mFluidInputs)));
+        stats.gtRecipes++;
+        return true;
+    }
+
+    /** mFluidInputs -> 去重合并的流体消耗列表(null/空栈跳过)。 */
+    private static List<FluidUse> fluidUses(FluidStack[] inputs) {
+        if (inputs == null || inputs.length == 0) {
+            return java.util.Collections.emptyList();
+        }
+        Map<String, Integer> merged = new java.util.LinkedHashMap<>();
+        for (FluidStack f : inputs) {
+            if (f == null || f.getFluid() == null) {
+                continue;
+            }
+            String name = f.getFluid()
+                .getName();
+            if (name == null || name.isEmpty()) {
+                continue;
+            }
+            merged.put(name, merged.getOrDefault(name, 0) + Math.max(0, f.amount));
+        }
+        if (merged.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        List<FluidUse> list = new ArrayList<>(merged.size());
+        for (Map.Entry<String, Integer> e : merged.entrySet()) {
+            list.add(new FluidUse(e.getKey(), e.getValue()));
+        }
+        return list;
+    }
+
+    /**
+     * 流体 -> 材料锚:流体对应 GT 材料时返回可定价的"锭"(无锭回落热锭/粉/宝石)形态物品;
+     * 非材料流体或取不到物品返回 null。供 EmcEngine 的"144L = 1 锭价值"规则使用。
+     */
+    public static ItemStack materialAnchorStack(net.minecraftforge.fluids.Fluid fluid) {
+        if (!available() || fluid == null) {
+            return null;
+        }
+        try {
+            Materials mat = Materials.getGtMaterialFromFluid(fluid);
+            if (mat == null) {
+                return null;
+            }
+            OrePrefixes[] anchors = { OrePrefixes.ingot, OrePrefixes.ingotHot, OrePrefixes.dust, OrePrefixes.gem };
+            for (OrePrefixes p : anchors) {
+                ItemStack stack;
+                try {
+                    stack = GTOreDictUnificator.get(p, mat, 1);
+                } catch (Throwable t) {
+                    stack = null;
+                }
+                if (stack != null && stack.getItem() != null && stack.getItemDamage() != OreDictionary.WILDCARD_VALUE) {
+                    return stack;
+                }
+            }
+        } catch (Throwable t) {
+            // 非材料流体/异常 -> 无锚
+        }
+        return null;
+    }
+
+    /**
+     * 流体反推产者表:遍历全部 RecipeMap,收集"零物品输出 + 恰好一种流体输出 + 有物品输入"
+     * 的配方为流体产者(用于给无材料锚的流体按配方成本反推价值)。跳过规则与 collectOne
+     * 一致(disabled/fake/hidden/回收/通配/一次性工具输入)。返回条数记入 stats.gtFluidRecipes。
+     */
+    public static void collectFluidProducers(Map<String, List<FluidProducer>> out, EmcStats stats) {
+        if (!available()) {
+            return;
+        }
+        ensureTierCaps();
+        for (RecipeMap<?> map : new ArrayList<>(RecipeMap.ALL_RECIPE_MAPS.values())) {
+            String mapName = map.unlocalizedName;
+            for (GTRecipe r : new ArrayList<>(map.getAllRecipes())) {
+                if (r == null || !r.mEnabled || r.mFakeRecipe) {
                     continue;
                 }
                 if (r.mHidden && !AutoEmcConfig.includeHiddenRecipes) {
-                    stats.gtSkippedDisabled++;
                     continue;
                 }
-                // 回收类配方不参与定价:GT 用 RECYCLE 元数据 + "*_recycling" 分类标记
-                // (逆向粉碎/逆向冶炼/电弧炉回收,即把成品/材料打回粉末或锭,会形成环或低估价值)。
                 if (r.getMetadataOrDefault(GTRecipeConstants.RECYCLE, false)) {
-                    stats.gtSkippedRecycle++;
                     continue;
                 }
                 RecipeCategory rc = r.getRecipeCategory();
                 if (rc != null && rc.unlocalizedName.contains("recycling")) {
-                    stats.gtSkippedRecycle++;
                     continue;
                 }
-                boolean hasFluidInput = r.mFluidInputs != null && r.mFluidInputs.length > 0;
-                if (hasFluidInput) {
-                    // 流体不参与计价,配方仍有效
-                    stats.gtRecipesWithFluid++;
-                }
-                if (r.mOutputs == null || r.mOutputs.length == 0 || r.mOutputs[0] == null) {
-                    stats.gtSkippedNoOutput++;
+                // 只收集"零物品输出 + 恰好一种流体输出":多输出/带物品输出的成本归属不清,不反推
+                if (r.mOutputs != null && r.mOutputs.length > 0) {
                     continue;
                 }
-                boolean hasItemInput = r.mInputs != null && r.mInputs.length > 0;
-                if (!hasItemInput && !hasFluidInput) {
-                    // 无任何输入的"凭空产出"(如创造类)不算配方
-                    stats.gtSkippedNoOutput++;
+                if (r.mFluidOutputs == null || r.mFluidOutputs.length != 1 || r.mFluidOutputs[0] == null) {
+                    continue;
+                }
+                FluidStack fout = r.mFluidOutputs[0];
+                if (fout.getFluid() == null || fout.amount <= 0) {
                     continue;
                 }
                 if (r.mChances != null && r.mChances.length > 0 && r.mChances[0] < 10000) {
-                    // 主输出带概率 → 不可靠的产出者,跳过
-                    stats.gtSkippedChance++;
-                    continue;
+                    continue; // 输出带概率 -> 不可靠产者
                 }
-
-                ItemStack out = r.mOutputs[0];
-                if (out.getItem() == null || out.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
-                    stats.gtSkippedWildcard++;
-                    continue;
-                }
-                ItemKey outKey = ItemKey.of(out);
-                int outQty = Math.max(1, out.stackSize);
-
-                int tier;
-                if (steamCapable && r.mEUt <= AutoEmcConfig.steamMaxEUt) {
-                    // 蒸汽时代就能做 → 不选 LV
-                    tier = EmcRecipe.TIER_STEAM;
-                } else {
-                    tier = voltageRankOf(r.mEUt);
-                }
-
-                // 只把"物品输入"算进成本;流体输入忽略
+                // 物品输入校验(消耗计价的材料;通配/一次性工具输入会跳过该配方)
                 List<EmcIngredient> inputs = new ArrayList<>();
                 boolean bad = false;
-                if (hasItemInput) {
+                if (r.mInputs != null) {
                     for (ItemStack in : r.mInputs) {
                         if (in == null || in.getItem() == null) {
-                            stats.gtSkippedNoOutput++;
                             bad = true;
                             break;
                         }
                         if (in.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
-                            stats.gtSkippedWildcard++;
                             bad = true;
                             break;
                         }
                         if (isOneTimeItem(in)) {
-                            // 一次性物品(编程电路、ggfab 工具/模具/铸模):不消耗,不参与计价也不展开
-                            stats.gtToolSlots++;
                             continue;
                         }
                         inputs.add(EmcIngredient.fixed(ItemKey.of(in), Math.max(1, in.stackSize)));
                     }
                 }
-                if (bad) {
+                if (bad || inputs.isEmpty()) {
                     continue;
                 }
-                // 纯流体输入配方(inputs 为空)→ 材料成本为 0,仍登记为产出者
-
-                // 输入形态等级:取所有输入选项里最"锚定"的(锭/宝石>粉>小堆粉/粒>小撮粉>矿石),
-                // 用于"粉末优先锭粉碎、粉末合成粉末优先用最大粉末"。
-                int formRank = 3;
-                for (EmcIngredient ing : inputs) {
-                    for (ItemKey opt : ing.options) {
-                        formRank = Math.max(formRank, formRank(opt.toStack()));
-                    }
+                String fname = fout.getFluid()
+                    .getName();
+                if (fname == null || fname.isEmpty()) {
+                    continue;
                 }
-
-                // 流体输入总量(L):"合成路径液体少"优先,越少越优先
-                int fluidAmount = 0;
-                if (r.mFluidInputs != null) {
-                    for (FluidStack f : r.mFluidInputs) {
-                        if (f != null) {
-                            fluidAmount += f.amount;
-                        }
-                    }
-                }
-
-                producers.computeIfAbsent(outKey, k -> new ArrayList<>())
-                    .add(new EmcRecipe(outKey, outQty, inputs, category, tier, mapName, formRank, fluidAmount));
-                stats.gtRecipes++;
-                mapCount++;
+                out.computeIfAbsent(fname, k -> new ArrayList<>())
+                    .add(new FluidProducer(inputs, fluidUses(r.mFluidInputs), fout.amount, mapName));
+                stats.gtFluidRecipes++;
             }
-            stats.gtMapRecipeCounts.put(mapName, mapCount);
         }
-        stats.gtMaps = RecipeMap.ALL_RECIPE_MAPS.size();
+    }
+
+    /** GT 配方主输出描述(reg@dmg),用于 recipe 级错误日志;失败回落 "?"。 */
+    private static String outDesc(GTRecipe r) {
+        try {
+            if (r == null || r.mOutputs == null || r.mOutputs.length == 0 || r.mOutputs[0] == null) {
+                return "?";
+            }
+            ItemStack out = r.mOutputs[0];
+            return out.getItem() == null ? "?"
+                : ItemKey.of(out)
+                    .toString();
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /**
+     * GT 装配线(Assembly Line)配方收集。装配线配方不走 RecipeMap:GT 用数据棒
+     * (GTRecipe.RecipeAssemblyLine.sAssemblylineRecipes 静态注册表)存储,机器按数据棒/输出
+     * 取配方;RecipeMap.ALL_RECIPE_MAPS 里只有一张 NEI 展示用的假配方图
+     * (gt.recipe.fakeAssemblylineProcess,.addFakeRecipe -> mFakeRecipe=true,被 map 收集过滤),
+     * 所以之前装配线产物全部缺价。这里直接扫真实注册表,规则与 GT map 一致:
+     * 材料成本 = 物品输入(含 oredict 替代),流体忽略,多方块类别,等级按 mEUt。
+     * 注意:研究/扫描(数据棒解锁)不影响造价,不建模。
+     */
+    public static void collectAssemblyLine(Map<ItemKey, List<EmcRecipe>> producers, EmcStats stats) {
+        if (!available()) {
+            return;
+        }
+        List<GTRecipe.RecipeAssemblyLine> recipes = new ArrayList<>(GTRecipe.RecipeAssemblyLine.sAssemblylineRecipes);
+        RecipeScan.Result res = RecipeScan.forEachRecipe(
+            "gt-assemblyline",
+            "assembly-line-sAssemblylineRecipes",
+            recipes,
+            r -> alOutDesc(r),
+            r -> collectOneAl(r, producers, stats));
+        stats.alRecipes += res.handled;
+        stats.alSkippedError += res.errors;
+    }
+
+    /** 单条装配线配方 -> 是否登记为产出者;内容性跳过(通配/无输入等)内部计数并返回 false。 */
+    private static boolean collectOneAl(GTRecipe.RecipeAssemblyLine r, Map<ItemKey, List<EmcRecipe>> producers,
+        EmcStats stats) {
+        if (r == null) {
+            return false;
+        }
+        ItemStack out = r.mOutput;
+        if (out == null || out.getItem() == null) {
+            return false;
+        }
+        if (out.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+            stats.alSkipped++;
+            return false;
+        }
+        int outQty = Math.max(1, out.stackSize);
+        ItemStack[] ins = r.mInputs;
+        if (ins == null || ins.length == 0) {
+            // 无输入凭空产出:不算配方
+            stats.alSkipped++;
+            return false;
+        }
+
+        List<EmcIngredient> inputs = new ArrayList<>();
+        ItemStack[][] oredictAlts = r.mOreDictAlt;
+        for (int i = 0; i < ins.length; i++) {
+            ItemStack base = ins[i];
+            if (base == null || base.getItem() == null) {
+                stats.alSkipped++;
+                return false;
+            }
+            if (base.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+                stats.alSkipped++;
+                return false;
+            }
+            if (isOneTimeItem(base)) {
+                // 防御:装配线输入本不应含一次性物品;真出现就按工具处理,不参与计价
+                continue;
+            }
+            int qty = Math.max(1, base.stackSize);
+            ItemStack[] slotAlts = oredictAlts != null && i < oredictAlts.length ? oredictAlts[i] : null;
+
+            List<ItemKey> options = new ArrayList<>();
+            boolean altInvalid = false;
+            if (slotAlts != null && slotAlts.length > 0) {
+                // oredict 替代集:槽位可用的等价选项,数量与主输入一致
+                for (ItemStack alt : slotAlts) {
+                    if (alt == null || alt.getItem() == null) {
+                        continue;
+                    }
+                    if (alt.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+                        altInvalid = true;
+                        break;
+                    }
+                    options.add(ItemKey.of(alt));
+                }
+            }
+            if (options.isEmpty()) {
+                if (altInvalid) {
+                    // 替代集含通配 -> 无法确定该槽成本,整条跳过
+                    stats.alSkipped++;
+                    return false;
+                }
+                // 无替代集或替代全被过滤 -> 用主输入本身
+                options.add(ItemKey.of(base));
+            }
+            if (options.size() == 1) {
+                inputs.add(EmcIngredient.fixed(options.get(0), qty));
+            } else {
+                inputs.add(EmcIngredient.alternatives(options, qty));
+            }
+        }
+
+        // 输入形态等级(粉末优先等排序用)与流体总量(液体少优先),同 GT map 语义
+        int formRank = 3;
+        for (EmcIngredient ing : inputs) {
+            for (ItemKey opt : ing.options) {
+                formRank = Math.max(formRank, formRank(opt.toStack()));
+            }
+        }
+        int fluidAmount = 0;
+        if (r.mFluidInputs != null) {
+            for (FluidStack f : r.mFluidInputs) {
+                if (f != null) {
+                    fluidAmount += f.amount;
+                }
+            }
+        }
+
+        ItemKey outKey = ItemKey.of(out);
+        int tier = voltageRankOf(r.mEUt);
+        producers.computeIfAbsent(outKey, k -> new ArrayList<>())
+            .add(
+                new EmcRecipe(
+                    outKey,
+                    outQty,
+                    inputs,
+                    EmcRecipe.CAT_MULTI,
+                    tier,
+                    "assemblyline",
+                    formRank,
+                    fluidAmount,
+                    fluidUses(r.mFluidInputs)));
+        return true;
+    }
+
+    /** 装配线配方输出描述(reg@dmg),用于错误日志;失败回落 "?"。 */
+    private static String alOutDesc(GTRecipe.RecipeAssemblyLine r) {
+        try {
+            if (r == null || r.mOutput == null || r.mOutput.getItem() == null) {
+                return "?";
+            }
+            return ItemKey.of(r.mOutput)
+                .toString();
+        } catch (Throwable t) {
+            return "?";
+        }
     }
 
     /** GTMoreEMC 形态系数表条目:材料价 × num / den(数值与原文一致,prefix 映射到 GT5.09 命名) */
@@ -548,8 +867,8 @@ public final class GtMachines {
             new FormMul(OrePrefixes.gem, 1, 1), new FormMul(OrePrefixes.gemChipped, 1, 4),
             new FormMul(OrePrefixes.gemFlawed, 1, 2), new FormMul(OrePrefixes.gemFlawless, 2, 1),
             new FormMul(OrePrefixes.gemExquisite, 4, 1),
-            // 注意:lens 不进质量种子 —— GT5.09 透镜有真实产出配方(车床 板→透镜),
-            // 规则要求透镜优先按该配方定价(见 EmcEngine 车床板→透镜偏好)。
+            // 注意:lens 不进质量种子 —— GT5.09 透镜有真实产出配方(车床 板->透镜),
+            // 规则要求透镜优先按该配方定价(见 EmcEngine 车床板->透镜偏好)。
             // 锭/热锭/粒
             new FormMul(OrePrefixes.ingot, 1, 1), new FormMul(OrePrefixes.ingotHot, 1, 1),
             new FormMul(OrePrefixes.nugget, 1, 9),
@@ -599,7 +918,7 @@ public final class GtMachines {
                 if (m == null) {
                     continue;
                 }
-                // GTMoreEMC:非元素且无组分 → 跳过(GT5.09 空组分 getMass 会回落 Tc=43,无意义)
+                // GTMoreEMC:非元素且无组分 -> 跳过(GT5.09 空组分 getMass 会回落 Tc=43,无意义)
                 if (m.mElement == null && (m.mMaterialList == null || m.mMaterialList.isEmpty())) {
                     continue;
                 }

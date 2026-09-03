@@ -10,7 +10,10 @@ import java.util.Map;
 import java.util.Set;
 
 import net.minecraft.item.ItemStack;
+import net.minecraftforge.fluids.FluidRegistry;
 import net.minecraftforge.oredict.OreDictionary;
+
+import com.gtnh.autoemc.api.registry.EmcRegistry;
 
 import moze_intel.projecte.api.proxy.IEMCProxy;
 
@@ -33,8 +36,24 @@ public final class EmcEngine {
     /** 该值仅表示"递归进行中不可用"的边,不对外暴露 */
     private static final int UNKNOWN = -1;
 
+    /** 地下流体兜底价:无法从锭/配方推导的流体按 1 L(mB)=1 EMC,即每 144L = 144。 */
+    private static final long FLUID_UNDERGROUND_PER_144L = 144L;
+
     private final Map<ItemKey, List<EmcRecipe>> producers;
     private final IEMCProxy proxy;
+
+    /** 流体反推产者表:fluidName -> 产出它的"零物品输出、单一流体输出"配方(可能为空) */
+    private final Map<String, List<FluidProducer>> fluidProducers;
+
+    /**
+     * 已解析流体价值(每 144L 的 EMC;0 也缓存=免费,如无产者且非材料的流体)。
+     * UNKNOWN(-1)不缓存 —— 递归环上的流体下次重试;resolveDeferred/fluidRecompute
+     * 会清掉 0 缓存让基础定价后的重估重算。
+     */
+    private final Map<String, Long> fluidMemo = new HashMap<>();
+
+    /** 流体递归环检测栈(流体->流体/流体->物品->流体),与物品求值栈配合防跨类环 */
+    private final Deque<String> fluidStack = new ArrayDeque<>();
 
     /** 所有已求出的值(锚点/预载缓存/新算) */
     private final Map<ItemKey, Integer> known = new HashMap<>();
@@ -52,7 +71,14 @@ public final class EmcEngine {
     private final Map<ItemKey, Integer> seeded = new HashMap<>();
 
     public EmcEngine(Map<ItemKey, List<EmcRecipe>> producers, IEMCProxy proxy) {
+        this(producers, java.util.Collections.<String, List<FluidProducer>>emptyMap(), proxy);
+    }
+
+    public EmcEngine(Map<ItemKey, List<EmcRecipe>> producers, Map<String, List<FluidProducer>> fluidProducers,
+        IEMCProxy proxy) {
         this.producers = producers;
+        this.fluidProducers = fluidProducers == null ? java.util.Collections.<String, List<FluidProducer>>emptyMap()
+            : fluidProducers;
         this.proxy = proxy;
     }
 
@@ -98,7 +124,7 @@ public final class EmcEngine {
         return seeded.containsKey(key);
     }
 
-    /** 该物品当前是否已被 PE 定价(含玩家手动设置)→ 属于"锚点",不算我们的成果 */
+    /** 该物品当前是否已被 PE 定价(含玩家手动设置)-> 属于"锚点",不算我们的成果 */
     public boolean isAnchoredByPe(ItemKey key) {
         return peHas(key);
     }
@@ -201,7 +227,7 @@ public final class EmcEngine {
         boolean bestPositive = false;
         boolean bestFreeInput = false;
         List<Pick> bestPicks = null;
-        // 透镜专用:若存在有效的车床 板→透镜 配方,优先选它(规则:透镜优先按车床板配方定价,
+        // 透镜专用:若存在有效的车床 板->透镜 配方,优先选它(规则:透镜优先按车床板配方定价,
         // 压过精宝石/切割等其他产法);不存在时退回常规选择。
         boolean lensOutput = GtMachines.isLensKey(key);
         EmcRecipe bestLathe = null;
@@ -315,7 +341,7 @@ public final class EmcEngine {
                 }
             }
             if (anyOption && minPriced == Long.MAX_VALUE) {
-                return true; // 该槽没有任何正价选项 → 落到的就是 0 价物品
+                return true; // 该槽没有任何正价选项 -> 落到的就是 0 价物品
             }
         }
         return false;
@@ -371,7 +397,198 @@ public final class EmcEngine {
             }
             outPicks.add(new Pick(bestKey, ing.qty));
         }
+        // 流体输入计入成本:每 144L = 流体价值(材料流体 144L=对应锭价;无锭配方反推;免费流体为 0)
+        for (FluidUse fu : r.fluids) {
+            long v144 = resolveFluidValue144(fu.fluidName, stack);
+            if (v144 == UNKNOWN) {
+                return UNKNOWN; // 流体价值递归中/当前不可解析 -> 该候选失效(等第二遍/重估)
+            }
+            if (v144 <= 0) {
+                if (!AutoEmcConfig.unpricedIsZero) {
+                    return UNKNOWN; // 不允许把无价流体当 0 用时,配方失效
+                }
+                continue; // 免费流体(水/蒸汽/未定价)不产生成本
+            }
+            long term = (v144 * fu.amountL + 143) / 144; // 向上取整:144L = 1 锭
+            sum += term;
+            if (sum < 0) {
+                return UNKNOWN; // 溢出保护
+            }
+        }
         return sum;
+    }
+
+    /**
+     * 流体每 144L 的价值(UNKNOWN=-1 表示当前不可解析,不缓存;0 缓存=免费流体):
+     * <ol>
+     * <li>EmcRegistry 注册值(其他 mod/用户经 Registry API 注册,语义=每 144L);</li>
+     * <li>GT 材料流体:对应材料锭(回落热锭/粉/宝石)的物品价值 —— "144L = 1 锭";</li>
+     * <li>配方反推:零物品输出、单一流体输出的机器配方,成本 = 物品输入 + 流体输入(递归),
+     * 多条产者取每 144L 最便宜;</li>
+     * <li>以上皆无 -> 地下流体兜底价 1 L(mB)=1 EMC,即每 144L = 144。</li>
+     * </ol>
+     * 递归环(流体↔物品/流体↔流体)返回 UNKNOWN 不缓存,由 resolveDeferred / fluidRecompute
+     * 在基础定价后重估。
+     */
+    private long resolveFluidValue144(String name, Deque<ItemKey> stack) {
+        Long memo = fluidMemo.get(name);
+        if (memo != null) {
+            return memo;
+        }
+        if (fluidStack.size() > 24) {
+            return UNKNOWN; // 递归过深防御
+        }
+        // 1) 注册表(其他 mod / 未来 Registry Types 流体价)
+        // 流体注册名可含 ':'(EmcKey canonical 用 ':' 分隔 type:id,构造器拒收)-> 含 ':' 的
+        // 名字跳过注册表查询,仍可走材料锚/配方反推(那两条链用原始名作 map 键,不经 EmcKey)。
+        long reg = 0;
+        if (name.indexOf(':') < 0) {
+            int rv = EmcRegistry.instance()
+                .getFluidValue(name);
+            if (rv > 0) {
+                reg = rv;
+            }
+        }
+        if (reg > 0) {
+            fluidMemo.put(name, reg);
+            return reg;
+        }
+        // 2) GT 材料流体 -> 锭/形态物品价值
+        try {
+            net.minecraftforge.fluids.Fluid flu = FluidRegistry.getFluid(name);
+            if (flu != null) {
+                ItemStack anchor = GtMachines.materialAnchorStack(flu);
+                if (anchor != null) {
+                    long av = eval(ItemKey.of(anchor), stack);
+                    if (av > 0) {
+                        fluidMemo.put(name, av);
+                        return av;
+                    }
+                    if (av == UNKNOWN) {
+                        return UNKNOWN; // 锚在递归环上:不缓存,等基础定价后重估
+                    }
+                    // 锚 = 0(材料本身无价)-> 落入反推/免费
+                }
+            }
+        } catch (Throwable t) {
+            return UNKNOWN; // GT API 异常:按当前不可解析处理,不缓存
+        }
+        // 3) 配方反推(无产者 -> 4) 地下流体兜底价 1mB(=GT 的 L)=1 EMC,即每 144L = 144)
+        List<FluidProducer> list = fluidProducers.get(name);
+        if (list == null || list.isEmpty()) {
+            fluidMemo.put(name, FLUID_UNDERGROUND_PER_144L);
+            return FLUID_UNDERGROUND_PER_144L;
+        }
+        if (fluidStack.contains(name)) {
+            return UNKNOWN; // 流体环
+        }
+        fluidStack.addLast(name);
+        long best = Long.MAX_VALUE;
+        try {
+            for (FluidProducer p : list) {
+                long cost = fluidProducerCost(p, stack);
+                if (cost == UNKNOWN || cost < 0) {
+                    continue;
+                }
+                long per144 = (cost * 144 + p.outputL - 1) / p.outputL; // 每 144L 折算,向上取整
+                if (per144 < best) {
+                    best = per144;
+                }
+            }
+        } finally {
+            fluidStack.removeLast();
+        }
+        if (best == Long.MAX_VALUE) {
+            return UNKNOWN; // 产者全部不可解析:不缓存,重估时再试
+        }
+        fluidMemo.put(name, best);
+        return best;
+    }
+
+    /** 单条流体产者配方总成本(物品输入按槽有价优先选价 + 流体输入递归);任一部分不可解析返回 UNKNOWN。 */
+    private long fluidProducerCost(FluidProducer p, Deque<ItemKey> stack) {
+        long sum = 0;
+        for (EmcIngredient ing : p.inputs) {
+            long bestPriced = Long.MAX_VALUE;
+            boolean any = false;
+            boolean sawFree = false;
+            for (ItemKey opt : ing.options) {
+                long v = eval(opt, stack);
+                if (v == UNKNOWN) {
+                    continue;
+                }
+                any = true;
+                if (v > 0 && v < bestPriced) {
+                    bestPriced = v;
+                } else if (v <= 0) {
+                    sawFree = true;
+                }
+            }
+            if (!any) {
+                return UNKNOWN;
+            }
+            long opt = bestPriced != Long.MAX_VALUE ? bestPriced : 0;
+            if (!sawFree && bestPriced == Long.MAX_VALUE) {
+                return UNKNOWN;
+            }
+            if (!AutoEmcConfig.unpricedIsZero && opt <= 0) {
+                return UNKNOWN;
+            }
+            sum += opt * ing.qty;
+            if (sum < 0) {
+                return UNKNOWN;
+            }
+        }
+        for (FluidUse fu : p.fluids) {
+            long v144 = resolveFluidValue144(fu.fluidName, stack);
+            if (v144 == UNKNOWN) {
+                return UNKNOWN;
+            }
+            if (v144 <= 0) {
+                if (!AutoEmcConfig.unpricedIsZero) {
+                    return UNKNOWN;
+                }
+                continue;
+            }
+            sum += (v144 * fu.amountL + 143) / 144;
+            if (sum < 0) {
+                return UNKNOWN;
+            }
+        }
+        return sum;
+    }
+
+    /** 已解析流体价值数(日志/排查用)。 */
+    public int fluidValueCount() {
+        return fluidMemo.size();
+    }
+
+    /**
+     * 流体第二遍(cache-miss 全量求值时由 EmcRunner 调用):清空流体 memo 与(规则叶子外的)
+     * 全部物品估值,重跑主求值 + resolveDeferred。第一遍因流体价值不可解析(环/顺序依赖)
+     * 而失效的配方候选,在第二遍拿到解析好的流体价值后重选;也修正第一遍"免费流体压价"
+     * 造成的低估。返回重估出的 >0 数量。
+     */
+    public int fluidRecompute() {
+        fluidMemo.clear();
+        for (ItemKey key : new ArrayList<>(known.keySet())) {
+            if (seeded.containsKey(key) || circuitAveraged.contains(key)) {
+                continue;
+            }
+            known.remove(key);
+            chosen.remove(key);
+            pickedOptions.remove(key);
+        }
+        int computed = 0;
+        for (ItemKey key : producers.keySet()) {
+            if (knownValue(key) != null || isAnchoredByPe(key)) {
+                continue;
+            }
+            if (evalTarget(key) > 0) {
+                computed++;
+            }
+        }
+        return computed + resolveDeferred();
     }
 
     /** (类别, 等级, 组装机系, 输入形态等级, 流体量, 单位成本) 字典序;后四者只用于同类别同等级之间比较 */
@@ -411,7 +628,7 @@ public final class EmcEngine {
                 continue;
             }
             if (peHas(key)) {
-                continue; // PE 已定价(含玩家手动)→ 不覆盖
+                continue; // PE 已定价(含玩家手动)-> 不覆盖
             }
             result.put(key, v);
         }
@@ -592,6 +809,14 @@ public final class EmcEngine {
         boolean changed;
         do {
             changed = false;
+            // 流体 0 缓存清掉:若其产者/锚在上轮被定价,本轮重估能取到正价
+            java.util.Iterator<String> fit = fluidMemo.keySet()
+                .iterator();
+            while (fit.hasNext()) {
+                if (fluidMemo.get(fit.next()) <= 0) {
+                    fit.remove();
+                }
+            }
             for (ItemKey key : new ArrayList<>(producers.keySet())) {
                 Integer v = known.get(key);
                 if (v == null || v > 0) {

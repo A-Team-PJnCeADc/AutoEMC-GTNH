@@ -39,10 +39,16 @@ dependencies {
     // NEI-RecipeTree + NEI(GTNH fork):仅客户端 /projecte_autoemc 对齐配方树用,运行时软依赖
     devOnlyNonPublishable(rfg.deobf(project.files("libs/neirecipetree-0.0.5.jar")))
     devOnlyNonPublishable(rfg.deobf(project.files("libs/NotEnoughItems-2.8.44-GTNH.jar")))
-    // unimixins:NEI/CCC 的 coremod 链需要 mixin 环境;保持与游戏实例同版本(仅运行期,不发布)
-    runtimeOnlyNonPublishable(project.files("libs/unimixins-all-1.7.10-0.1.23.jar"))
+    // unimixins:NEI/CCC 的 coremod 链需要 mixin 环境;usesMixins=true 时 gtnhconvention 自动
+    // 添加 unimixins 依赖(devOnlyNonPublishable + required-after),这里不再手动声明
+    // 显式 compileOnly(libs 里现成的 full jar):仅为了让 IDE(IntelliJ)的符号解析看到
+    // com.gtnewhorizon.gtnhmixins.IMixins —— 自定义配置 devOnlyNonPublishable 不会被 IJ 映射进
+    // 模块依赖,编辑器会误报"无法解析符号";gradle 编译/运行不受影响。compileOnly 不发布不进运行时。
+    compileOnly(files("libs/unimixins-all-1.7.10-0.1.23.jar"))
     // CodeChickenCore(GTNH 版把 codechicken.lib 打包在里面):NEI coremod 需要 codechicken.lib.asm.ASMInit
     devOnlyNonPublishable(rfg.deobf(project.files("libs/CodeChickenCore-1.4.10.jar")))
     // GregTech GTNH 2.8.4(本地 mega jar,含 GT++/bartworks/ggfab 等):仅编译期。
     compileOnly(rfg.deobf(project.files("libs/gregtech-5.09.51.482.jar")))
+    // Avaritia(无尽贪婪 GTNH fork 1.77):大工作台配方源,运行时软依赖,仅编译期。
+    compileOnly(rfg.deobf(project.files("libs/Avaritia-1.77.jar")))
 }

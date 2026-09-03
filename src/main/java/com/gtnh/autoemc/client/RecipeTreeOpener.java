@@ -79,7 +79,7 @@ public final class RecipeTreeOpener {
             }
 
             if (nodes.get(0).source == null) {
-                // 引擎无该物品记录 → NEI 反查普通打开(仅简单物品可工作)
+                // 引擎无该物品记录 -> NEI 反查普通打开(仅简单物品可工作)
                 plainOpen(mc, root);
                 return;
             }
@@ -184,7 +184,7 @@ public final class RecipeTreeOpener {
         return new NEIRecipeRef(handler, 0);
     }
 
-    /** 服务端节点 → 合成 handler → NEIRecipeRef */
+    /** 服务端节点 -> 合成 handler -> NEIRecipeRef */
     private static NEIRecipeRef syntheticRef(ResolvedNode node) {
         List<PositionedStack> inputs = new ArrayList<>();
         for (ViewNode.Child c : node.children) {
@@ -208,7 +208,7 @@ public final class RecipeTreeOpener {
         return new NEIRecipeRef(handler, 0);
     }
 
-    /** 引擎无记录 → NEI 反查第一条产出它的配方 */
+    /** 引擎无记录 -> NEI 反查第一条产出它的配方 */
     private static void plainOpen(Minecraft mc, ItemStack root) {
         List<NEIRecipeRef> refs = RecipeLookup.findRecipes(root);
         NEIRecipeRef ref = null;

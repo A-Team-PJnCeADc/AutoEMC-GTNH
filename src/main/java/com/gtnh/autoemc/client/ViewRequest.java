@@ -24,7 +24,7 @@ public final class ViewRequest {
         return name == null ? null : name + "@" + stack.getItemDamage();
     }
 
-    /** "注册名@meta" → ItemStack(1 个);解析失败返回 null */
+    /** "注册名@meta" -> ItemStack(1 个);解析失败返回 null */
     public static ItemStack resolveKey(String key) {
         if (key == null) {
             return null;

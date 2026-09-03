@@ -20,6 +20,8 @@ import java.util.regex.Pattern;
 
 import net.minecraft.item.Item;
 
+import com.gtnh.autoemc.api.recipe.RecipeSource;
+
 /**
  * emc-values.json 本地缓存。
  * 结构:{"schemaVersion":2,"fingerprint":"<sha256>","values":{"注册名@damage":emc,...},
@@ -32,7 +34,7 @@ import net.minecraft.item.Item;
 public final class ValueStore {
 
     /** 公式语义版本:改了求值规则就 +1,强制全量重算 */
-    public static final int FORMULA_VERSION = 18;
+    public static final int FORMULA_VERSION = 20;
     private static final int SCHEMA = 2;
 
     private static final Pattern FINGERPRINT_PATTERN = Pattern.compile("\"fingerprint\"\\s*:\\s*\"([0-9a-f]{16,64})\"");
@@ -41,27 +43,21 @@ public final class ValueStore {
 
     private ValueStore() {}
 
-    /** 指纹:配方集合(数量级)+ 配置 + 公式版本。配方大改/配置变化 → 指纹变化 → 全量重算 */
+    /** 指纹:配方集合(数量级)+ 配置 + 公式版本。配方大改/配置变化 -> 指纹变化 -> 全量重算 */
     public static String computeFingerprint(EmcStats stats) {
         StringBuilder sb = new StringBuilder();
         sb.append("formula=")
             .append(FORMULA_VERSION)
             .append('\n');
-        sb.append("craft=")
-            .append(stats.craftingRecipes)
-            .append('\n');
-        sb.append("smelt=")
-            .append(stats.smeltRecipes)
-            .append('\n');
-        sb.append("gtmaps=")
-            .append(stats.gtMaps)
-            .append('\n');
-        for (Map.Entry<String, Integer> e : stats.gtMapRecipeCounts.entrySet()) {
-            sb.append("map:")
-                .append(e.getKey())
-                .append('=')
-                .append(e.getValue())
-                .append('\n');
+        // 配方集合指纹 = 每个配方源自己声明的指纹行(按注册顺序拼接,内置三源与历史
+        // craft/smelt/gtmaps+map 行逐字节一致)。新增配方源时,若它贡献的配方集合可能变化,
+        // 必须在 RecipeSource.fingerprintLines 里给出随集合变化的行,否则缓存指纹覆盖不到
+        // 该源 -> 命中旧缓存静默沿用旧值(契约见 RecipeSource#fingerprintLines)。
+        for (RecipeSource src : RecipeCollector.sources()) {
+            for (String line : src.fingerprintLines(stats)) {
+                sb.append(line)
+                    .append('\n');
+            }
         }
         List<String> cfg = new ArrayList<>();
         for (String s : AutoEmcConfig.multiMaps) {
@@ -196,7 +192,7 @@ public final class ValueStore {
         return chains;
     }
 
-    /** "注册名@meta*qty" → Pick;数量缺省 1;解析失败返回 null */
+    /** "注册名@meta*qty" -> Pick;数量缺省 1;解析失败返回 null */
     private static Pick parsePick(String s) {
         int star = s.lastIndexOf('*');
         String keyPart = s;

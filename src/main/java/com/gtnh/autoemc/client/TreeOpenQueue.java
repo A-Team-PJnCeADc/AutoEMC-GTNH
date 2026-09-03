@@ -35,14 +35,14 @@ public final class TreeOpenQueue {
     /** Netty IO 线程:接收一个分片 */
     public static synchronized void onChainChunk(int total, int chunk, String info, List<String> lines) {
         if (chunk == 0) {
-            // 新请求的第一个分片 → 重置组装状态
+            // 新请求的第一个分片 -> 重置组装状态
             expectedTotal = total;
             nextChunk = 0;
             pendingInfo = info;
             pendingNodes.clear();
         }
         if (expectedTotal <= 0 || chunk != nextChunk) {
-            // 乱序/重复/无头分片 → 丢弃整个请求,避免错位
+            // 乱序/重复/无头分片 -> 丢弃整个请求,避免错位
             expectedTotal = 0;
             pendingNodes.clear();
             return;

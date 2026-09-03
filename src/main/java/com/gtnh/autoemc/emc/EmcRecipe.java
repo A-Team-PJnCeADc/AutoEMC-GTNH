@@ -21,6 +21,8 @@ public final class EmcRecipe {
     /** 单次产出的数量(>0) */
     public final int outputQty;
     public final List<EmcIngredient> inputs;
+    /** 流体输入(参与成本计价;工作台/熔炉/大工作台为空) */
+    public final List<FluidUse> fluids;
     /** CAT_* 常量 */
     public final int category;
     /** TIER_STEAM=-1,否则为电压等级索引(0=ULV,1=LV,...) */
@@ -44,8 +46,23 @@ public final class EmcRecipe {
             .contains("assembl");
     }
 
+    /** 无流体输入的构造(工作台/熔炉/大工作台)。 */
     public EmcRecipe(ItemKey output, int outputQty, List<EmcIngredient> inputs, int category, int tier, String source,
         int formRank, int fluidAmount) {
+        this(
+            output,
+            outputQty,
+            inputs,
+            category,
+            tier,
+            source,
+            formRank,
+            fluidAmount,
+            java.util.Collections.<FluidUse>emptyList());
+    }
+
+    public EmcRecipe(ItemKey output, int outputQty, List<EmcIngredient> inputs, int category, int tier, String source,
+        int formRank, int fluidAmount, List<FluidUse> fluids) {
         this.output = output;
         this.outputQty = outputQty;
         this.inputs = inputs;
@@ -54,6 +71,7 @@ public final class EmcRecipe {
         this.source = source;
         this.formRank = formRank;
         this.fluidAmount = fluidAmount;
+        this.fluids = fluids == null ? java.util.Collections.<FluidUse>emptyList() : fluids;
     }
 
     public static String categoryName(int category) {

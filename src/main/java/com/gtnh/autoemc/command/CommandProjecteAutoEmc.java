@@ -10,10 +10,12 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.ChatComponentText;
 
+import com.gtnh.autoemc.api.recipe.RecipeSource;
 import com.gtnh.autoemc.emc.EmcRuntime;
 import com.gtnh.autoemc.emc.EmcRuntime.ChainItem;
 import com.gtnh.autoemc.emc.ItemKey;
 import com.gtnh.autoemc.emc.Pick;
+import com.gtnh.autoemc.emc.RecipeCollector;
 import com.gtnh.autoemc.net.ChannelAutoEmc;
 
 /**
@@ -21,6 +23,9 @@ import com.gtnh.autoemc.net.ChannelAutoEmc;
  * - 必须走 view 子命令(不使用裸根命令);不带物品参数 = 查看手持物品;
  * - 装了 NEI-RecipeTree 时:客户端打开配方树,并按 AutoEMC 引擎选中的配方整树强制对齐
  * (对齐链由服务端按最近一次求值的 chosen/picks 递归构建、分片下发),查看完毕关闭后自动结束对齐。
+ *
+ * <p>
+ * /projecte_autoemc sources — 列出已注册配方源及可用性(诊断:新加的 mod 源是否被注册)。
  */
 public class CommandProjecteAutoEmc extends CommandBase {
 
@@ -31,7 +36,7 @@ public class CommandProjecteAutoEmc extends CommandBase {
 
     @Override
     public String getCommandUsage(ICommandSender sender) {
-        return "/projecte_autoemc view [<namespace>:<name>[@<meta>]]";
+        return "/projecte_autoemc <view [<namespace>:<name>[@<meta>]] | sources>";
     }
 
     @Override
@@ -49,6 +54,10 @@ public class CommandProjecteAutoEmc extends CommandBase {
 
         // 必须走 view 子命令,不使用裸根命令
         String sub = args.length > 0 ? args[0] : "";
+        if ("sources".equalsIgnoreCase(sub)) {
+            listSources(player);
+            return;
+        }
         if (!"view".equalsIgnoreCase(sub)) {
             player.addChatMessage(new ChatComponentText("\u00a7e[AutoEMC] 用法:" + getCommandUsage(sender)));
             return;
@@ -65,7 +74,7 @@ public class CommandProjecteAutoEmc extends CommandBase {
                 return;
             }
         } else {
-            // view 不带物品参数 → 查看手持物品
+            // view 不带物品参数 -> 查看手持物品
             target = player.getHeldItem();
             if (target == null) {
                 player.addChatMessage(
@@ -89,14 +98,30 @@ public class CommandProjecteAutoEmc extends CommandBase {
         }
         List<String> nodeLines = buildChainLines(targetKey);
         if (nodeLines == null || nodeLines.isEmpty()) {
-            // 引擎没有该物品的链记录 → 只发根节点,客户端按普通方式打开(不强制对齐)
+            // 引擎没有该物品的链记录 -> 只发根节点,客户端按普通方式打开(不强制对齐)
             nodeLines = new ArrayList<>();
             nodeLines.add(keyOf(target));
         }
         ChannelAutoEmc.sendChain(player, info, nodeLines);
     }
 
-    /** 递归链 → 节点行;target 不在引擎记录里返回 null */
+    /** 列出已注册配方源及可用性(可用于验证 register() 是否生效)。 */
+    private static void listSources(EntityPlayerMP player) {
+        List<RecipeSource> sources = RecipeCollector.sources();
+        player.addChatMessage(new ChatComponentText("\u00a7e[AutoEMC] 已注册配方源(" + sources.size() + "):"));
+        for (RecipeSource s : sources) {
+            String state;
+            try {
+                state = s.isAvailable() ? "\u00a7a可用" : "\u00a77不可用(依赖 mod 未加载)";
+            } catch (Throwable t) {
+                state = "\u00a74可用性检测异常";
+            }
+            player.addChatMessage(
+                new ChatComponentText("\u00a7f - " + s.id() + " " + state + "\u00a77 " + s.description()));
+        }
+    }
+
+    /** 递归链 -> 节点行;target 不在引擎记录里返回 null */
     private static List<String> buildChainLines(ItemKey target) {
         List<ChainItem> chain = EmcRuntime.buildChain(target);
         if (chain == null) {
