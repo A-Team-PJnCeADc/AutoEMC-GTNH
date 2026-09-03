@@ -239,6 +239,59 @@ public final class GtMachines {
         return out;
     }
 
+    /**
+     * key 是否为透镜类物品:①prefix = lens 的 GT 材料透镜;②任一 oredict 名含 lens
+     * (craftingLens*、lensGlass 等);③注册名含 lens(GT 固定件透镜等没挂材料关联的,
+     * 如激光蚀刻机用的玻璃透镜类物品)。三者满足其一即按透镜处理(车床板→透镜偏好、
+     * 配方选择时有价透镜优先)。
+     */
+    public static boolean isLensKey(ItemKey key) {
+        if (!available() || key == null || key.item == null) {
+            return false;
+        }
+        try {
+            ItemData d = GTOreDictUnificator.getAssociation(key.toStack());
+            if (d != null && d.mPrefix == OrePrefixes.lens) {
+                return true;
+            }
+            for (int oreId : OreDictionary.getOreIDs(key.toStack())) {
+                String n = OreDictionary.getOreName(oreId);
+                if (n != null && n.toLowerCase()
+                    .contains("lens")) {
+                    return true;
+                }
+            }
+            String reg = net.minecraft.item.Item.itemRegistry.getNameForObject(key.item);
+            return reg != null && reg.toLowerCase()
+                .contains("lens");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 是否为车床板→透镜配方:来源含 lathe 且输入槽里含板(plate)形态的选项 */
+    public static boolean isLathePlateToLens(EmcRecipe r) {
+        if (r == null || r.source == null
+            || !r.source.toLowerCase()
+                .contains("lathe")
+            || r.inputs == null) {
+            return false;
+        }
+        try {
+            for (EmcIngredient ing : r.inputs) {
+                for (ItemKey opt : ing.options) {
+                    ItemData d = GTOreDictUnificator.getAssociation(opt.toStack());
+                    if (d != null && d.mPrefix == OrePrefixes.plate) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // 忽略
+        }
+        return false;
+    }
+
     /** 一次性物品/工具(编程/配置电路、ggfab 工具/模具/铸模等):机器配方里不消耗,不参与计价也不展开 */
     public static boolean isOneTimeItem(ItemStack in) {
         if (in == null || in.getItem() == null) {
@@ -494,7 +547,9 @@ public final class GtMachines {
             // 宝石:原石/碎/瑕/无瑕/精品
             new FormMul(OrePrefixes.gem, 1, 1), new FormMul(OrePrefixes.gemChipped, 1, 4),
             new FormMul(OrePrefixes.gemFlawed, 1, 2), new FormMul(OrePrefixes.gemFlawless, 2, 1),
-            new FormMul(OrePrefixes.gemExquisite, 4, 1), new FormMul(OrePrefixes.lens, 3, 4),
+            new FormMul(OrePrefixes.gemExquisite, 4, 1),
+            // 注意:lens 不进质量种子 —— GT5.09 透镜有真实产出配方(车床 板→透镜),
+            // 规则要求透镜优先按该配方定价(见 EmcEngine 车床板→透镜偏好)。
             // 锭/热锭/粒
             new FormMul(OrePrefixes.ingot, 1, 1), new FormMul(OrePrefixes.ingotHot, 1, 1),
             new FormMul(OrePrefixes.nugget, 1, 9),

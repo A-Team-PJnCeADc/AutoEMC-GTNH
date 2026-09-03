@@ -19,6 +19,11 @@ import moze_intel.projecte.api.proxy.IEMCProxy;
  *
  * 规则:
  * - 已被 ProjectE 定价的物品(含玩家 /setemc、custom_emc.json 手动设置)是锚点,永不覆盖;
+ * - 可选材料槽(同 oredict 多副本,如 GT 盐 vs 其他 mod 盐):只要存在有价选项就选有价者,
+ * 无价副本不以 0 压过有价副本;全部无价才按 0(受 unpricedIsZero 约束);
+ * - 配方比较:含无价输入的配方让位给全有价输入的配方(如同一产物 7 个蚀刻配方各吃一颗不同
+ * 透镜时,选透镜有价的那条,不选无价透镜当免费的);所有候选都含无价输入(材料写死、
+ * 别无选择)才退回成本比较;
  * - 没有产出配方的原材料按 0 计(unpricedIsZero=true 时,0 也会作为成本参与);
  * - 配方选择:(工作台 > 单方块机器 > 多方块),同级选低等级(蒸汽 < ULV < LV …),再比总成本;
  * - 递归环(配方互相依赖)使该条边失效,不会自我抬价;最终仍无法定价的物品按 0。
@@ -194,7 +199,16 @@ public final class EmcEngine {
         EmcRecipe best = null;
         long bestUnitCost = 0;
         boolean bestPositive = false;
+        boolean bestFreeInput = false;
         List<Pick> bestPicks = null;
+        // 透镜专用:若存在有效的车床 板→透镜 配方,优先选它(规则:透镜优先按车床板配方定价,
+        // 压过精宝石/切割等其他产法);不存在时退回常规选择。
+        boolean lensOutput = GtMachines.isLensKey(key);
+        EmcRecipe bestLathe = null;
+        long latheUnitCost = 0;
+        boolean lathePositive = false;
+        boolean latheFreeInput = false;
+        List<Pick> lathePicks = null;
         List<Pick> tmpPicks = new ArrayList<>();
         for (EmcRecipe r : list) {
             tmpPicks.clear();
@@ -204,17 +218,63 @@ public final class EmcEngine {
             }
             long unitCost = cost / Math.max(1, r.outputQty);
             boolean positive = cost > 0;
-            // 正成本配方优先于零成本配方:零成本要么是"循环回收配方"(如能量水晶→粉
-            // 的 macerator,依赖的环被拆成 0),要么是"全无价材料",两者都不应压过真正
-            // 有基础材料成本的配方(哪怕后者等级更高)。同级同成本再用 (类别,等级,单位成本)。
-            boolean take = best == null || (positive && !bestPositive)
-                || (positive == bestPositive && better(r, unitCost, best, bestUnitCost));
+            // 含无价输入的配方让位给全有价输入的配方:同一产物常有多个配方,其中某条吃到的材料
+            // 没价(如硅压印板 7 个蚀刻配方各吃一颗不同透镜,无价透镜按 0 计入成本会让那条看起来
+            // 最便宜而被选中、树里出现无价材料;盐等跨 mod 同材料同理)。优先级:正成本 > 零成本,
+            // 之后优先选无任何无价输入的配方;所有候选都含无价输入(材料被写死、别无选择)才退回
+            // 常规成本比较,唯一配方不受影响。
+            boolean freeInput = recipeUsesFreeInput(r, stack);
+            boolean take;
+            if (best == null) {
+                take = true;
+            } else if (positive && !bestPositive) {
+                take = true;
+            } else if (!positive && bestPositive) {
+                take = false;
+            } else if (!freeInput && bestFreeInput) {
+                take = true;
+            } else if (freeInput && !bestFreeInput) {
+                take = false;
+            } else {
+                take = better(r, unitCost, best, bestUnitCost);
+            }
             if (take) {
                 best = r;
                 bestUnitCost = unitCost;
                 bestPositive = positive;
+                bestFreeInput = freeInput;
                 bestPicks = new ArrayList<>(tmpPicks);
             }
+            if (lensOutput && GtMachines.isLathePlateToLens(r)) {
+                boolean ltake;
+                if (bestLathe == null) {
+                    ltake = true;
+                } else if (positive && !lathePositive) {
+                    ltake = true;
+                } else if (!positive && lathePositive) {
+                    ltake = false;
+                } else if (!freeInput && latheFreeInput) {
+                    ltake = true;
+                } else if (freeInput && !latheFreeInput) {
+                    ltake = false;
+                } else {
+                    ltake = better(r, unitCost, bestLathe, latheUnitCost);
+                }
+                if (ltake) {
+                    bestLathe = r;
+                    latheUnitCost = unitCost;
+                    lathePositive = positive;
+                    latheFreeInput = freeInput;
+                    lathePicks = new ArrayList<>(tmpPicks);
+                }
+            }
+        }
+        if (lensOutput && bestLathe != null) {
+            best = bestLathe;
+            bestUnitCost = latheUnitCost;
+            bestPositive = lathePositive;
+            bestFreeInput = latheFreeInput;
+            bestPicks = lathePicks;
         }
         stack.removeLast();
         if (best == null) {
@@ -231,11 +291,43 @@ public final class EmcEngine {
         return value;
     }
 
+    /**
+     * 配方是否含无价输入(选中它等于把某 0 价物品当免费材料):任一输入槽按槽内选择逻辑
+     * (有价优先)最终只能落到 0 —— 槽里所有选项都不是正价,或固定槽本身就是那颗无价物。
+     * 返回 true 表示该配方在比价时应让位给全有价输入的配方;若所有候选都含无价输入
+     * (该材料被写死、别无选择)则仍按常规成本比较,唯一配方不受影响。
+     */
+    private boolean recipeUsesFreeInput(EmcRecipe r, Deque<ItemKey> stack) {
+        if (r == null || r.inputs == null) {
+            return false;
+        }
+        for (EmcIngredient ing : r.inputs) {
+            long minPriced = Long.MAX_VALUE;
+            boolean anyOption = false;
+            for (ItemKey opt : ing.options) {
+                long v = eval(opt, stack);
+                if (v == UNKNOWN) {
+                    continue;
+                }
+                anyOption = true;
+                if (v > 0 && v < minPriced) {
+                    minPriced = v;
+                }
+            }
+            if (anyOption && minPriced == Long.MAX_VALUE) {
+                return true; // 该槽没有任何正价选项 → 落到的就是 0 价物品
+            }
+        }
+        return false;
+    }
+
     private long costOf(EmcRecipe r, Deque<ItemKey> stack, List<Pick> outPicks) {
         long sum = 0;
         for (EmcIngredient ing : r.inputs) {
-            long bestOption = Long.MAX_VALUE;
-            ItemKey bestKey = null;
+            long bestPriced = Long.MAX_VALUE;
+            ItemKey bestPricedKey = null;
+            long bestFree = Long.MAX_VALUE;
+            ItemKey bestFreeKey = null;
             boolean anyOption = false;
             for (ItemKey opt : ing.options) {
                 long v = eval(opt, stack);
@@ -243,13 +335,32 @@ public final class EmcEngine {
                     continue; // 该选项正处在当前递归环上,换下一个选项
                 }
                 anyOption = true;
-                if (v < bestOption) {
-                    bestOption = v;
-                    bestKey = opt;
+                if (v > 0) {
+                    if (v < bestPriced) {
+                        bestPriced = v;
+                        bestPricedKey = opt;
+                    }
+                } else {
+                    // 无价(0)选项:不立即选 —— 同一材料的多个 mod 副本(如 GT 盐 vs 其他 mod 的盐)
+                    // 若允许无价副本以 0 压过有价副本,成本会被低估、树里还选中无价物品;
+                    // 规则:只要存在有价选项就优先选有价者,全无价才退回 0。
+                    if (bestFreeKey == null) {
+                        bestFree = 0;
+                        bestFreeKey = opt;
+                    }
                 }
             }
             if (!anyOption) {
                 return UNKNOWN;
+            }
+            long bestOption;
+            ItemKey bestKey;
+            if (bestPricedKey != null) {
+                bestOption = bestPriced;
+                bestKey = bestPricedKey;
+            } else {
+                bestOption = bestFree;
+                bestKey = bestFreeKey;
             }
             if (!AutoEmcConfig.unpricedIsZero && bestOption <= 0) {
                 return UNKNOWN; // 不允许把无价材料当 0 用时,这条配方失效

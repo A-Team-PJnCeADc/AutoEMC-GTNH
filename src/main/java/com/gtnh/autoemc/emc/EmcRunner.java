@@ -230,14 +230,20 @@ public final class EmcRunner {
         // 第二遍:修复顺序依赖 sticky-0(纯环保持 0,有基础配方的项得到正确正值)
         int deferredFixed = engine.resolveDeferred();
 
-        // 同等级电路板统一价(规则:任意电路板 = 同等级总价/数量,含真实板的覆盖):
-        // 有成员价被改动时,引用电路板的依赖方是按旧的最便宜成员价算的 → 清空重估一遍,
-        // 保证下游值与树里展示的电路板均价一致。稳态(cache hit 且板价已统一)下改 0、不重估。
+        // 同等级电路板统一价(规则:任意电路板 = 同等级总价/数量,含真实板的覆盖)
         int tierChanged = engine.uniformCircuitBoardTiers();
-        if (tierChanged > 0) {
+
+        // 一致性重估:本次运行只要有 0→有价 的变化(假电路板扫尾定价、延迟修正 sticky-0、
+        // 电路板同级统一),就可能存在按旧值(0)算过并滞留无价 pick 的依赖方 —— 例如求值时
+        // 某槽所有透镜都还没价,0 透镜被当免费选中、成本记 0;等透镜定价后该产品值偏低、
+        // /view 里还显示无价透镜。清空除规则叶子外的估值重算一遍,让它们在最终价上重选配方。
+        // 稳态(cache hit 全量预载)三者都为 0,不触发,启动速度不受影响。
+        if (circuitBoardsPriced > 0 || deferredFixed > 0 || tierChanged > 0) {
             int recomputed = engine.recomputeAfterTierUniform();
             LOG.info(
-                "Circuit board tier averaging (uniform): changed {} members to tier mean; re-evaluated {} downstream values.",
+                "Consistency re-evaluation after {} board-averaged + {} deferred fixes + {} tier-uniform changes: recomputed {} downstream values.",
+                circuitBoardsPriced,
+                deferredFixed,
                 tierChanged,
                 recomputed);
         }

@@ -44,9 +44,5 @@ dependencies {
     // CodeChickenCore(GTNH 版把 codechicken.lib 打包在里面):NEI coremod 需要 codechicken.lib.asm.ASMInit
     devOnlyNonPublishable(rfg.deobf(project.files("libs/CodeChickenCore-1.4.10.jar")))
     // GregTech GTNH 2.8.4(本地 mega jar,含 GT++/bartworks/ggfab 等):仅编译期。
-    // 运行时放 dev 会让 dev/CI runServer 变成"启动整个 GTNH 服务器"——mega jar 内各 mod 连锁
-    // required-after/静态引用整包同伴(IC2/AE2/modularui/TwilightForest/…),逐个补齐依赖才能启动。
-    // 实际玩法验证走游戏实例 mods 目录;CI 冒烟只需证明 AutoEMC 在无 GT 时正常降级启动
-    // (RecipeCollector/GtMachines/EmcEngine 全部 available() 短路,已有软依赖设计)。
     compileOnly(rfg.deobf(project.files("libs/gregtech-5.09.51.482.jar")))
 }
