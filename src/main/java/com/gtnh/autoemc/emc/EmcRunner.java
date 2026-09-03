@@ -194,6 +194,18 @@ public final class EmcRunner {
         EmcEngine engine = new EmcEngine(producers, proxy);
         engine.preload(cached);
 
+        // GTMoreEMC 移植:GT 材料形态直接按 质量×72×形态系数 定价(命中即定,不再走配方图;
+        // 不覆盖 PE 锚点)。注入到 known 里,优先于一切配方求值。
+        Map<ItemKey, Integer> seeds = new HashMap<>();
+        if (GtMachines.available()) {
+            seeds.putAll(GtMachines.collectMaterialSeeds());
+            seeds.putAll(GtMachines.collectFixedSeeds());
+        }
+        int seededCount = engine.addSeeds(seeds);
+        if (seededCount > 0) {
+            LOG.info("GT material mass-seeding (mass*72, GTMoreEMC form table): seeded {} form values.", seededCount);
+        }
+
         int computed = 0;
         int zeroValued = 0;
         for (ItemKey key : producers.keySet()) {
@@ -217,6 +229,18 @@ public final class EmcRunner {
 
         // 第二遍:修复顺序依赖 sticky-0(纯环保持 0,有基础配方的项得到正确正值)
         int deferredFixed = engine.resolveDeferred();
+
+        // 同等级电路板统一价(规则:任意电路板 = 同等级总价/数量,含真实板的覆盖):
+        // 有成员价被改动时,引用电路板的依赖方是按旧的最便宜成员价算的 → 清空重估一遍,
+        // 保证下游值与树里展示的电路板均价一致。稳态(cache hit 且板价已统一)下改 0、不重估。
+        int tierChanged = engine.uniformCircuitBoardTiers();
+        if (tierChanged > 0) {
+            int recomputed = engine.recomputeAfterTierUniform();
+            LOG.info(
+                "Circuit board tier averaging (uniform): changed {} members to tier mean; re-evaluated {} downstream values.",
+                tierChanged,
+                recomputed);
+        }
 
         Map<ItemKey, Integer> finalValues = engine.collectFinalValues();
         int newCount = 0;
@@ -247,6 +271,24 @@ public final class EmcRunner {
         if (prunedMerged > 0) {
             LOG.info("Pruned {} tool children from merged chains.", prunedMerged);
         }
+        // 规则叶子(质量种子形态 / 同级平均电路板)没有配方输入:旧规则时代存下的机器配方链已过期,
+        // 保留会让 /view 继续展开已经被种子/平均价定死价的形态 → 剔除,避免树里出现与价格来源矛盾的展开。
+        int prunedLeafChains = 0;
+        Iterator<Map.Entry<ItemKey, List<Pick>>> cit = mergedChains.entrySet()
+            .iterator();
+        while (cit.hasNext()) {
+            if (engine.isDefinedLeaf(
+                cit.next()
+                    .getKey())) {
+                cit.remove();
+                prunedLeafChains++;
+            }
+        }
+        if (prunedLeafChains > 0) {
+            LOG.info(
+                "Pruned {} stale chains for rule-priced leaf nodes (mass seeds / tier-averaged boards).",
+                prunedLeafChains);
+        }
 
         if (!finalValues.isEmpty()) {
             ValueStore.save(cacheFile, fingerprint, finalValues, mergedChains);
@@ -264,7 +306,7 @@ public final class EmcRunner {
     private static void apply(PendingResult r) {
         if (r.finalValues.isEmpty()) {
             LOG.info("Nothing to register (all targets already priced by ProjectE).");
-            EmcRuntime.capture(r.finalValues, r.engine.snapshotChosen(), r.mergedChains);
+            EmcRuntime.capture(r.finalValues, r.engine.snapshotChosen(), r.mergedChains, r.engine.snapshotAveraged());
             return;
         }
         try {
@@ -294,7 +336,7 @@ public final class EmcRunner {
             // 注册/重建失败只记日志:值下次启动会自愈重试,链照常 capture 供 view 回放
             LOG.error("AutoEMC register/map#2 failed:", t);
         }
-        EmcRuntime.capture(r.finalValues, r.engine.snapshotChosen(), r.mergedChains);
+        EmcRuntime.capture(r.finalValues, r.engine.snapshotChosen(), r.mergedChains, r.engine.snapshotAveraged());
     }
 
     /**
@@ -347,6 +389,13 @@ public final class EmcRunner {
                 String cat = r == null ? "" : EmcRecipe.categoryName(r.category);
                 String tier = r == null ? "" : EmcRecipe.tierName(r.tier);
                 String src = r == null ? "" : r.source;
+                if (r == null && engine.isSeeded(key)) {
+                    cat = "seed";
+                    src = "mass72";
+                } else if (r == null && engine.isAveraged(key)) {
+                    cat = "circuitAvg";
+                    src = "tier-average";
+                }
                 w.write(
                     Item.itemRegistry.getNameForObject(key.item) + "@"
                         + key.damage

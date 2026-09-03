@@ -43,6 +43,8 @@ public final class EmcEngine {
     private final Map<ItemKey, List<Pick>> pickedOptions = new HashMap<>();
     /** 按"同级平均"定价的假电路板(无产出配方,非 producers 成员;最终值同样要注册) */
     private final Set<ItemKey> circuitAveraged = new HashSet<>();
+    /** GTMoreEMC mass-seeding:GT material forms priced directly (mass*72*form multiplier). */
+    private final Map<ItemKey, Integer> seeded = new HashMap<>();
 
     public EmcEngine(Map<ItemKey, List<EmcRecipe>> producers, IEMCProxy proxy) {
         this.producers = producers;
@@ -62,6 +64,33 @@ public final class EmcEngine {
 
     public boolean isPreloaded(ItemKey key) {
         return preloaded.contains(key);
+    }
+
+    /**
+     * 注入 GTMoreEMC 质量定价种子(preload 之后调用,覆盖缓存旧值):形态物品直接按
+     * 质量×72×形态系数定值(known 命中优先于配方求值),不覆盖 PE 已锚定的物品。
+     * 返回实际注入条数(>0 且非 PE 锚点)。
+     */
+    public int addSeeds(Map<ItemKey, Integer> seeds) {
+        int added = 0;
+        for (Map.Entry<ItemKey, Integer> e : seeds.entrySet()) {
+            Integer v = e.getValue();
+            if (v == null || v <= 0) {
+                continue;
+            }
+            if (peHas(e.getKey())) {
+                continue;
+            }
+            known.put(e.getKey(), v);
+            seeded.put(e.getKey(), v);
+            added++;
+        }
+        return added;
+    }
+
+    /** 该 key 是否为本次质量定价种子(形态物品,无 chosen/picks,是叶子节点) */
+    public boolean isSeeded(ItemKey key) {
+        return seeded.containsKey(key);
     }
 
     /** 该物品当前是否已被 PE 定价(含玩家手动设置)→ 属于"锚点",不算我们的成果 */
@@ -257,27 +286,21 @@ public final class EmcEngine {
         return unitCost < bestUnitCost;
     }
 
-    /** 本次运行最终要写回 PE 的值(含预载缓存 + 平均价假电路板),已排除 PE/玩家已有的锚点 */
+    /**
+     * 本次运行最终要写回 PE 的值:known 里所有 >0 且非 PE/玩家锚点的条目。统一扫 known 而不是只扫
+     * producers —— 非 producer 的物品(同级平均的假电路板、质量定价种子、预载缓存的无配方旧值)也
+     * 必须每次启动重注册,否则重启后(PE 值不持久、靠 AutoEMC 每次重注册)树/EMC 里它们价格缺失
+     * 或归零(假电路板正是这种:无产出配方,不在 producers 里,上次平均的板子靠本次扫尾注册)。
+     */
     public Map<ItemKey, Integer> collectFinalValues() {
         Map<ItemKey, Integer> result = new HashMap<>();
-        for (ItemKey key : producers.keySet()) {
+        for (ItemKey key : known.keySet()) {
             Integer v = known.get(key);
             if (v == null || v <= 0) {
                 continue;
             }
             if (peHas(key)) {
                 continue; // PE 已定价(含玩家手动)→ 不覆盖
-            }
-            result.put(key, v);
-        }
-        // 假电路板没有产出配方、不在 producers 里,但平均价同样要注册
-        for (ItemKey key : circuitAveraged) {
-            if (result.containsKey(key)) {
-                continue;
-            }
-            Integer v = known.get(key);
-            if (v == null || v <= 0 || peHas(key)) {
-                continue;
             }
             result.put(key, v);
         }
@@ -324,9 +347,113 @@ public final class EmcEngine {
         return priced;
     }
 
+    /**
+     * 同等级电路板统一价(规则:任意电路板价格 = 同等级电路板总价 / 数量):遍历所有 circuit*
+     * oredict,把每个成员的价统一为该级当前有价成员的均值 —— 覆盖真实电路板的配方价,假板同样
+     * 落位。PE/玩家手动锚点不覆盖(但计入总价)。统一后成员是规则叶子:清掉 chosen/picks(不再
+     * 展开配方链),记入 circuitAveraged(注册与展示标签用)。返回价格被改动(相对原有 known 值)
+     * 的成员数 —— 改动 >0 表示有依赖方是按旧价算的,调用方应跑 {@link #recomputeAfterTierUniform()}。
+     */
+    public int uniformCircuitBoardTiers() {
+        int changed = 0;
+        if (!GtMachines.available()) {
+            return 0;
+        }
+        try {
+            for (String oreName : OreDictionary.getOreNames()) {
+                if (oreName == null || !oreName.startsWith("circuit")) {
+                    continue;
+                }
+                List<ItemStack> members = GtMachines.circuitOredictMembers(oreName);
+                if (members.isEmpty()) {
+                    continue;
+                }
+                long sum = 0;
+                int count = 0;
+                for (ItemStack ms : members) {
+                    int v = currentValue(ItemKey.of(ms));
+                    if (v > 0) {
+                        sum += v;
+                        count++;
+                    }
+                }
+                if (count <= 0) {
+                    continue;
+                }
+                int mean = (int) Math.min(Integer.MAX_VALUE - 1, Math.max(1, sum / count));
+                for (ItemStack ms : members) {
+                    ItemKey mk = ItemKey.of(ms);
+                    if (peHas(mk)) {
+                        continue; // 锚点不覆盖
+                    }
+                    Integer old = known.get(mk);
+                    known.put(mk, mean);
+                    chosen.remove(mk);
+                    pickedOptions.remove(mk);
+                    if (old == null || old != mean) {
+                        changed++;
+                    }
+                    circuitAveraged.add(mk);
+                }
+            }
+        } catch (Throwable t) {
+            // 统一失败不阻塞主流程(部分成员可能已统一)
+        }
+        return changed;
+    }
+
+    /**
+     * 统一价改动后的依赖重建:清空除规则叶子(质量种子 / 统一电路板)与 PE 锚点外全部已估值,
+     * 重跑主求值 + 第二遍 —— 使所有引用电路板的配方/产品在统一价上重算(否则下游保留旧的最便宜
+     * 成员价,值与树里展示的板价对不上)。返回本次重估出的 >0 值数量。
+     */
+    public int recomputeAfterTierUniform() {
+        for (ItemKey key : new ArrayList<>(known.keySet())) {
+            if (seeded.containsKey(key) || circuitAveraged.contains(key)) {
+                continue;
+            }
+            known.remove(key);
+            chosen.remove(key);
+            pickedOptions.remove(key);
+        }
+        int computed = 0;
+        for (ItemKey key : producers.keySet()) {
+            if (knownValue(key) != null || isAnchoredByPe(key)) {
+                continue;
+            }
+            if (evalTarget(key) > 0) {
+                computed++;
+            }
+        }
+        return computed + resolveDeferred();
+    }
+
+    /** 该 key 是否为规则直接定价的叶子(质量种子 / 同级平均电路板):价不来自配方,树不展开其配方链 */
+    public boolean isDefinedLeaf(ItemKey key) {
+        return seeded.containsKey(key) || circuitAveraged.contains(key);
+    }
+
+    /** 该 key 是否本次按同级电路板平均定价(CSV/展示用) */
+    public boolean isAveraged(ItemKey key) {
+        return circuitAveraged.contains(key);
+    }
+
+    private int currentValue(ItemKey key) {
+        Integer v = known.get(key);
+        if (v != null) {
+            return v;
+        }
+        return peHas(key) ? peValue(key) : 0;
+    }
+
     /** 每个物品选中的配方快照(命令展示用) */
     public Map<ItemKey, EmcRecipe> snapshotChosen() {
         return new HashMap<>(chosen);
+    }
+
+    /** 本次按同级平均定价的假电路板集合(EmcRuntime 展示来源用) */
+    public Set<ItemKey> snapshotAveraged() {
+        return new HashSet<>(circuitAveraged);
     }
 
     /** 每个物品选中配方时各输入槽实际取用的选项+数量快照(配方树对齐用) */

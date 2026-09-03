@@ -34,11 +34,19 @@
  * For more details, see https://docs.gradle.org/8.0.1/userguide/java_library_plugin.html#sec:java_library_configurations_graph
  */
 dependencies {
-    // ProjectE 1.7.10 GTNH fork(本地 jar,编译期 + 运行期;必需)
+    // ProjectE 1.7.10 GTNH fork(本地 jar,编译期 + 运行期;必需,required-after)
     devOnlyNonPublishable(rfg.deobf(project.files("libs/ProjectE-1.7.10-PE1.10.1.jar")))
-    // GregTech GTNH 2.8.4(本地 jar,编译期 + 运行期;软依赖,无 GT 时自动退化为 工作台+冶炼)
-    devOnlyNonPublishable(rfg.deobf(project.files("libs/gregtech-5.09.51.482.jar")))
     // NEI-RecipeTree + NEI(GTNH fork):仅客户端 /projecte_autoemc 对齐配方树用,运行时软依赖
     devOnlyNonPublishable(rfg.deobf(project.files("libs/neirecipetree-0.0.5.jar")))
     devOnlyNonPublishable(rfg.deobf(project.files("libs/NotEnoughItems-2.8.44-GTNH.jar")))
+    // unimixins:NEI/CCC 的 coremod 链需要 mixin 环境;保持与游戏实例同版本(仅运行期,不发布)
+    runtimeOnlyNonPublishable(project.files("libs/unimixins-all-1.7.10-0.1.23.jar"))
+    // CodeChickenCore(GTNH 版把 codechicken.lib 打包在里面):NEI coremod 需要 codechicken.lib.asm.ASMInit
+    devOnlyNonPublishable(rfg.deobf(project.files("libs/CodeChickenCore-1.4.10.jar")))
+    // GregTech GTNH 2.8.4(本地 mega jar,含 GT++/bartworks/ggfab 等):仅编译期。
+    // 运行时放 dev 会让 dev/CI runServer 变成"启动整个 GTNH 服务器"——mega jar 内各 mod 连锁
+    // required-after/静态引用整包同伴(IC2/AE2/modularui/TwilightForest/…),逐个补齐依赖才能启动。
+    // 实际玩法验证走游戏实例 mods 目录;CI 冒烟只需证明 AutoEMC 在无 GT 时正常降级启动
+    // (RecipeCollector/GtMachines/EmcEngine 全部 available() 短路,已有软依赖设计)。
+    compileOnly(rfg.deobf(project.files("libs/gregtech-5.09.51.482.jar")))
 }

@@ -3,14 +3,21 @@ package com.gtnh.autoemc.emc;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import net.minecraft.init.Items;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraftforge.fluids.FluidStack;
 import net.minecraftforge.oredict.OreDictionary;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import gregtech.api.enums.ItemList;
+import gregtech.api.enums.Materials;
 import gregtech.api.enums.OrePrefixes;
 import gregtech.api.enums.TierEU;
 import gregtech.api.interfaces.INetworkUpdatableItem;
@@ -27,6 +34,8 @@ import gregtech.api.util.GTRecipeConstants;
  * 结论均针对 GTNH 2.8.4 的 gregtech-5.09.51.482(新 RecipeMap API)。
  */
 public final class GtMachines {
+
+    private static final Logger LOG = LogManager.getLogger("AutoEMC");
 
     /** TierEU.RECIPE_* 升序 —— 各级配方 EU/t 上限 */
     private static long[] recipeEUtCaps;
@@ -206,6 +215,28 @@ public final class GtMachines {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** 一个 circuit* oredict 的全部有效成员栈(剔除 null / wildcard / 一次性工具);GT 未加载返回空表 */
+    public static List<ItemStack> circuitOredictMembers(String oreName) {
+        List<ItemStack> out = new ArrayList<>();
+        if (!available() || oreName == null) {
+            return out;
+        }
+        try {
+            for (ItemStack s : new ArrayList<>(OreDictionary.getOres(oreName))) {
+                if (s == null || s.getItem() == null || s.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+                    continue;
+                }
+                if (isOneTimeItem(s)) {
+                    continue;
+                }
+                out.add(s);
+            }
+        } catch (Throwable t) {
+            // 忽略
+        }
+        return out;
     }
 
     /** 一次性物品/工具(编程/配置电路、ggfab 工具/模具/铸模等):机器配方里不消耗,不参与计价也不展开 */
@@ -429,5 +460,157 @@ public final class GtMachines {
             stats.gtMapRecipeCounts.put(mapName, mapCount);
         }
         stats.gtMaps = RecipeMap.ALL_RECIPE_MAPS.size();
+    }
+
+    /** GTMoreEMC 形态系数表条目:材料价 × num / den(数值与原文一致,prefix 映射到 GT5.09 命名) */
+    private static final class FormMul {
+
+        final OrePrefixes prefix;
+        final int num;
+        final int den;
+
+        FormMul(OrePrefixes prefix, int num, int den) {
+            this.prefix = prefix;
+            this.num = num;
+            this.den = den;
+        }
+    }
+
+    private static volatile FormMul[] formTable;
+
+    /** 惰性建表:只有 GT 加载(collectMaterialSeeds 在 available() 之后)才会触碰 OrePrefixes 常量 */
+    private static FormMul[] formTable() {
+        FormMul[] t = formTable;
+        if (t != null) {
+            return t;
+        }
+        t = new FormMul[] {
+            // 矿石(石/末地石/地狱岩 三种)×4
+            new FormMul(OrePrefixes.ore, 4, 1), new FormMul(OrePrefixes.oreEndstone, 4, 1),
+            new FormMul(OrePrefixes.oreNetherrack, 4, 1),
+            // 粉:满粉=材料价,小堆粉=1/4,小撮粉=1/9
+            new FormMul(OrePrefixes.dust, 1, 1), new FormMul(OrePrefixes.dustSmall, 1, 4),
+            new FormMul(OrePrefixes.dustTiny, 1, 9),
+            // 宝石:原石/碎/瑕/无瑕/精品
+            new FormMul(OrePrefixes.gem, 1, 1), new FormMul(OrePrefixes.gemChipped, 1, 4),
+            new FormMul(OrePrefixes.gemFlawed, 1, 2), new FormMul(OrePrefixes.gemFlawless, 2, 1),
+            new FormMul(OrePrefixes.gemExquisite, 4, 1), new FormMul(OrePrefixes.lens, 3, 4),
+            // 锭/热锭/粒
+            new FormMul(OrePrefixes.ingot, 1, 1), new FormMul(OrePrefixes.ingotHot, 1, 1),
+            new FormMul(OrePrefixes.nugget, 1, 9),
+            // 杆/长杆(GT5.09 stick = GTCEu rod)
+            new FormMul(OrePrefixes.stick, 1, 2), new FormMul(OrePrefixes.stickLong, 1, 1),
+            new FormMul(OrePrefixes.foil, 1, 1), new FormMul(OrePrefixes.ring, 1, 4),
+            new FormMul(OrePrefixes.spring, 1, 1), new FormMul(OrePrefixes.springSmall, 1, 4),
+            new FormMul(OrePrefixes.round, 1, 1), new FormMul(OrePrefixes.bolt, 1, 8),
+            new FormMul(OrePrefixes.screw, 1, 9), new FormMul(OrePrefixes.wireFine, 1, 8),
+            // 转子/齿轮/小齿轮/框架
+            new FormMul(OrePrefixes.rotor, 4, 1), new FormMul(OrePrefixes.gearGt, 4, 1),
+            new FormMul(OrePrefixes.gearGtSmall, 1, 1), new FormMul(OrePrefixes.frameGt, 2, 1),
+            // 板:满板/双层板/致密板
+            new FormMul(OrePrefixes.plate, 1, 1), new FormMul(OrePrefixes.plateDouble, 2, 1),
+            new FormMul(OrePrefixes.plateDense, 9, 1),
+            // 线(1x=材料价/2 … 16x=×8,数量逐级翻倍)
+            new FormMul(OrePrefixes.wireGt01, 1, 2), new FormMul(OrePrefixes.wireGt02, 1, 1),
+            new FormMul(OrePrefixes.wireGt04, 2, 1), new FormMul(OrePrefixes.wireGt08, 4, 1),
+            new FormMul(OrePrefixes.wireGt16, 8, 1),
+            // 流体管:细/小/中(GTCEu normal)/大/巨/四联/九联
+            new FormMul(OrePrefixes.pipeTiny, 1, 2), new FormMul(OrePrefixes.pipeSmall, 1, 1),
+            new FormMul(OrePrefixes.pipeMedium, 3, 1), new FormMul(OrePrefixes.pipeLarge, 6, 1),
+            new FormMul(OrePrefixes.pipeHuge, 12, 1), new FormMul(OrePrefixes.pipeQuadruple, 4, 1),
+            new FormMul(OrePrefixes.pipeNonuple, 9, 1),
+            // 材料方块(9 份)
+            new FormMul(OrePrefixes.block, 9, 1), };
+        formTable = t;
+        return t;
+    }
+
+    /**
+     * GTMoreEMC 移植(质量定价种子):遍历全部 GT 材料,材料质量 = Materials.getMass()
+     * (元素=质子+中子;非元素=组分密度加权,GT5.09 公共 API),材料价 = 质量×72,再按
+     * {@link #formTable()} 的系数给材料实际存在的每个形态直接定价 —— 形态物品命中即定,
+     * 不再展开其机器/工作台配方(GTMoreEMC 固定价语义;是否支持该形态以物品是否真实存在
+     * 为准,GTOreDictUnificator.get 为 null 即跳过,等价于 GTMoreEMC 按 property/flag 门控)。
+     * 只在 GT 加载时可用;异常整体放弃并记日志(不让种子阶段搞崩求值)。
+     */
+    public static Map<ItemKey, Integer> collectMaterialSeeds() {
+        Map<ItemKey, Integer> seeds = new HashMap<>();
+        if (!available()) {
+            return seeds;
+        }
+        try {
+            FormMul[] table = formTable();
+            for (Materials m : Materials.values()) {
+                if (m == null) {
+                    continue;
+                }
+                // GTMoreEMC:非元素且无组分 → 跳过(GT5.09 空组分 getMass 会回落 Tc=43,无意义)
+                if (m.mElement == null && (m.mMaterialList == null || m.mMaterialList.isEmpty())) {
+                    continue;
+                }
+                long mass = m.getMass();
+                if (mass <= 0) {
+                    continue;
+                }
+                long base = mass * 72L;
+                for (FormMul f : table) {
+                    ItemStack stack;
+                    try {
+                        stack = GTOreDictUnificator.get(f.prefix, m, 1);
+                    } catch (Throwable t) {
+                        continue;
+                    }
+                    if (stack == null || stack.getItem() == null
+                        || stack.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+                        continue;
+                    }
+                    long v = base * f.num / f.den;
+                    if (v <= 0) {
+                        continue;
+                    }
+                    seeds.put(ItemKey.of(stack), (int) Math.min(Integer.MAX_VALUE - 1, v));
+                }
+            }
+        } catch (Throwable t) {
+            LOG.warn("GT material mass-seeding failed, no material seeds this run.", t);
+            seeds.clear();
+        }
+        return seeds;
+    }
+
+    private static void putIfValid(Map<ItemKey, Integer> seeds, ItemStack stack, long value) {
+        if (stack == null || stack.getItem() == null || stack.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
+            return;
+        }
+        if (value <= 0) {
+            return;
+        }
+        seeds.put(ItemKey.of(stack), (int) Math.min(Integer.MAX_VALUE - 1, value));
+    }
+
+    /**
+     * GTMoreEMC 末尾固定物品价(原文数值)。只收 GTNH 上能找到对应物品的条目:
+     * 原版纸=32(不依赖 GT);GT 的压缩耐火黏土=2106、耐火砖=2106、玻璃管=1440。
+     * GTMoreEMC 里 GTCEu 专属、GT5.09 无对应物的条目(木模空/砖=8、压缩焦炉黏土=16、
+     * 焦炉砖=16、焦炉砖外壳=64、原始砖外壳=8424)不在此列 —— GTNH 无这些物品,直接跳过。
+     */
+    public static Map<ItemKey, Integer> collectFixedSeeds() {
+        Map<ItemKey, Integer> seeds = new HashMap<>();
+        try {
+            putIfValid(seeds, new ItemStack(Items.paper), 32L);
+        } catch (Throwable t) {
+            // 忽略
+        }
+        if (!available()) {
+            return seeds;
+        }
+        try {
+            putIfValid(seeds, ItemList.CompressedFireclay.get(1), 2106L);
+            putIfValid(seeds, ItemList.Firebrick.get(1), 2106L);
+            putIfValid(seeds, ItemList.Circuit_Parts_Glass_Tube.get(1), 1440L);
+        } catch (Throwable t) {
+            LOG.warn("GT fixed EMC extras resolution failed, partial seeds kept.", t);
+        }
+        return seeds;
     }
 }

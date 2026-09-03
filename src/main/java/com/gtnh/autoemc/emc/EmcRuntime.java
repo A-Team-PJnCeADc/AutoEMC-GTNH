@@ -4,9 +4,11 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 服务端保留最近一次 AutoEMC 求值的结果(值 + 每个物品选中的配方 + 各输入槽实际取用的选项+数量),
@@ -21,6 +23,8 @@ public final class EmcRuntime {
     private static volatile Map<ItemKey, Integer> lastValues = new HashMap<>();
     private static volatile Map<ItemKey, EmcRecipe> lastChosen = new HashMap<>();
     private static volatile Map<ItemKey, List<Pick>> lastPicks = new HashMap<>();
+    /** 本次运行按同级平均定价的假电路板(describe 的来源标注用) */
+    private static volatile Set<ItemKey> lastAveraged = new HashSet<>();
 
     /** 对齐链上的一个节点:物品 + 引擎选中配方 + 该配方每个输入槽取用的物品与数量 */
     public static final class ChainItem {
@@ -44,7 +48,7 @@ public final class EmcRuntime {
     private EmcRuntime() {}
 
     public static void capture(Map<ItemKey, Integer> values, Map<ItemKey, EmcRecipe> chosen,
-        Map<ItemKey, List<Pick>> picks) {
+        Map<ItemKey, List<Pick>> picks, Set<ItemKey> averaged) {
         lastValues = new HashMap<>(values);
         lastChosen = new HashMap<>(chosen);
         Map<ItemKey, List<Pick>> picksCopy = new HashMap<>();
@@ -52,6 +56,7 @@ public final class EmcRuntime {
             picksCopy.put(e.getKey(), new ArrayList<>(e.getValue()));
         }
         lastPicks = picksCopy;
+        lastAveraged = averaged == null ? new HashSet<>() : new HashSet<>(averaged);
     }
 
     /** 返回形如 "EMC=800, 来源=工作台/crafting";无记录返回 null */
@@ -69,6 +74,8 @@ public final class EmcRuntime {
                 .append(EmcRecipe.tierName(r.tier))
                 .append(' ')
                 .append(r.source);
+        } else if (lastAveraged.contains(key)) {
+            sb.append(", 来源=同级电路板平均");
         } else {
             sb.append(", 来源=缓存");
         }
