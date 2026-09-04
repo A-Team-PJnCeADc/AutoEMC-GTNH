@@ -53,6 +53,21 @@ public final class TypeTableBridge {
         }
     }
 
+    /**
+     * 回放当前 PE 侧表(在 EMCMapper.map() 完成时由 mixin 调用):PE 每次 clearMaps+map 重建
+     * (含 /projecte reloadEMC 与 AutoEMC 自己的 map#2)都会把类型表清空 —— 这里把 AutoEMC
+     * 注册表(源,权威)全量重写回 PE 表,类型值立即自愈,无需等下一次 AutoEMC 注册。
+     */
+    public static void replayCurrent() {
+        Map<String, Integer> t = peTypeTable;
+        if (t == null) {
+            return;
+        }
+        synchronized (t) {
+            replay(t);
+        }
+    }
+
     public static void remove(EmcKey key) {
         Map<String, Integer> t = peTypeTable;
         if (t == null) {

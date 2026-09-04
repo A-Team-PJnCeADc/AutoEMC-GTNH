@@ -42,7 +42,16 @@ public abstract class EmcMapperTypeMixin {
 
     @Inject(method = "clearMaps", at = @At("HEAD"), remap = false)
     private static void autoemc$clearTypeTable(CallbackInfo ci) {
-        // PE 清空物品映射(clearMaps+map 重建)时类型表一并清空;AutoEMC 的 map#2 注册会重写
+        // PE 清空物品映射(clearMaps+map 重建)时类型表一并清空;随后 map() 完成时由
+        // autoemc$replayTypeTable 把 AutoEMC 注册表(源)回放回来,reload 后立即自愈。
         autoemc$typeValues.clear();
+    }
+
+    @Inject(method = "map", at = @At("RETURN"), remap = false)
+    private static void autoemc$replayTypeTable(CallbackInfo ci) {
+        // 每次 PE map() 完成(/projecte reloadEMC、AutoEMC 自己的 map#2、PE 首次 map)后,
+        // 把 AutoEMC 注册表(源)全量回放到这张类型表 —— clearMaps 清掉的流体/源质值即时恢复,
+        // 不依赖 AutoEMC 下次注册(旧行为:手动 reload 后类型值缺失到下次重注册)。
+        TypeTableBridge.replayCurrent();
     }
 }
