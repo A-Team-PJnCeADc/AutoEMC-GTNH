@@ -2,6 +2,29 @@ plugins {
     id("com.gtnewhorizons.gtnhconvention")
 }
 
+repositories {
+    // 依赖优先从 GTNH nexus public(聚合 Maven Central + GTNH releases/snapshots)下载,
+    // 避免依赖逐个直连 repo.maven.apache.org / forge / sponge 造成慢速与超时。
+    maven {
+        name = "GTNH Nexus Public"
+        url = uri("https://nexus.gtnewhorizons.com/repository/public/")
+    }
+}
+
+gradle.projectsEvaluated {
+    // gtnhgradle 在 apply/评估期注册默认仓库(Maven Central 等在 nexus 之前),且 repositories.gradle
+    // 的仓库可能追加得更晚。projectsEvaluated 时全部已就位 —— 把 nexus public 提到依赖仓库容器
+    // 首位,并移除 gtnhgradle 注册的同 URL 受限条目(功能已被无限制版覆盖),使依赖解析优先命中
+    // 聚合仓库、少直连 Central。
+    val repos = repositories as MutableList<org.gradle.api.artifacts.repositories.ArtifactRepository>
+    repos.removeAll { it.name == "GTNH Maven" }
+    val nexus = repos.find { it.name == "GTNH Nexus Public" }
+    if (nexus != null) {
+        repos.remove(nexus)
+        repos.add(0, nexus)
+    }
+}
+
 tasks.jar {
     manifest {
         // gtnhgradle 在 usesMixins=true 时会自动注入 MixinConfigs: mixins.autoemcgtnh.json,

@@ -1,5 +1,18 @@
-// Add any additional repositories for your dependencies here.
+// Additional repositories for dependencies.
+// 仓库被 gtnhgradle 自动 apply(与 build.gradle.kts 顶层 repositories 合并)。
 
 repositories {
-
+    // NEI-RecipeTree(GitHub Releases 直接作 ivy 仓库):XSana/NEI-RecipeTree 的 release asset
+    // 布局 = <tag>/<artifact>-<version>(-<classifier>).jar,正好匹配 ivy pattern。
+    // 0.0.5 发布含 neirecipetree-0.0.5-dev.jar(已反混淆 dev),直接编译期使用,无需 rfg.deobf。
+    ivy {
+        name = "NEI-RecipeTree GitHub Releases"
+        url = uri("https://github.com/XSana/NEI-RecipeTree/releases/download")
+        patternLayout {
+            artifact "[revision]/[artifact]-[revision](-[classifier]).[ext]"
+        }
+        metadataSources {
+            artifact() // release 无 pom/ivy.xml,按文件直取
+        }
+    }
 }

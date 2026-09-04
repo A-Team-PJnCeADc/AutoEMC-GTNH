@@ -69,6 +69,18 @@ public final class EmcEngine {
     private final Set<ItemKey> circuitAveraged = new HashSet<>();
     /** GTMoreEMC mass-seeding:GT material forms priced directly (mass*72*form multiplier). */
     private final Map<ItemKey, Integer> seeded = new HashMap<>();
+    /**
+     * 锭/热锭的"材料族补偿档 n"(规则:全套形态价 ×2^n):
+     * ① 材料存在 blast furnace 产者配方(直接产锭或产热锭,map 名含 blastfurnace,回收类排除)
+     * -> n = 这些高炉配方 EUt 电压档的最小值(高炉优先,不再看真空冷冻等低压产者,也不看温度);
+     * ② 无高炉配方的材料 -> n = 该锭 GT 机器配方(回收排除)EUt 电压档最低值,蒸汽(-1)/ULV(0)
+     * 按 0 计;③ 无机器配方/非锭返回 -1(不乘)。按锭 key 惰性计算缓存。
+     */
+    private final Map<ItemKey, Integer> voltageTierMemo = new HashMap<>();
+    /** 本次实际按电压放大过价(×2^n, n>0)的锭/热锭 key —— 粉只镜像这些锭。 */
+    private final Set<ItemKey> voltageScaledIngots = new HashSet<>();
+    /** 惰性:材料代表锭 key -> 该材料 blast furnace 产者配方 EUt 档最小值(无高炉配方的材料不在表里)。 */
+    private Map<ItemKey, Integer> blastMinTierByRep;
 
     public EmcEngine(Map<ItemKey, List<EmcRecipe>> producers, IEMCProxy proxy) {
         this(producers, java.util.Collections.<String, List<FluidProducer>>emptyMap(), proxy);
@@ -311,10 +323,168 @@ public final class EmcEngine {
             return 0;
         }
         int value = (int) Math.min(Integer.MAX_VALUE - 1, Math.max(0, bestUnitCost));
+        // 材料族电压补偿(规则:全套形态价 ×2^n)。n 见 ingotVoltageTier:高炉材料取该材料
+        // blast furnace 产者配方的 EUt 档最小值(回收排除);无高炉配方材料取锭机器配方 EUt 档
+        // 最低值。种子形态在 scaleSeededVoltageFamilies 已放大;这里兜配方求值的锭/热锭(无组分
+        // 异星材料等没有种子),缓存前放大 —— 任何以它为输入的后续求值(costOf 递归 eval)自动
+        // 读到放大价,顺序无关。同材料的锭与热锭用同一个 n(材料代表锭的),族内比价一致。
+        // PE/玩家锚点锭走上面 peHas 分支,不进这里,不被改。
+        ItemKey ingotRep = GtMachines.canonicalIngotKey(key);
+        int ingotTierN = ingotRep == null ? -1 : ingotVoltageTier(ingotRep);
+        if (ingotTierN > 0 && value > 0) {
+            value = scaleUp(value, ingotTierN);
+            if (key.equals(ingotRep)) {
+                voltageScaledIngots.add(key);
+            }
+        }
         known.put(key, value);
         chosen.put(key, best);
         pickedOptions.put(key, bestPicks == null ? new ArrayList<>() : bestPicks);
         return value;
+    }
+
+    /** 锭/热锭的"材料族补偿档 n":见 {@link #voltageTierMemo}。 */
+    private int ingotVoltageTier(ItemKey key) {
+        Integer n = voltageTierMemo.get(key);
+        if (n != null) {
+            return n;
+        }
+        int result = -1;
+        if (key != null && GtMachines.isIngotItem(key)) {
+            // 高炉优先:该材料(以代表锭为键)有 blast furnace 产者配方 -> n = 其中 EUt 档最小值
+            ItemKey rep = GtMachines.canonicalIngotKey(key);
+            if (rep != null) {
+                if (blastMinTierByRep == null) {
+                    blastMinTierByRep = GtMachines.blastFurnaceMinTierByIngot(producers);
+                }
+                Integer blastTier = blastMinTierByRep.get(rep);
+                if (blastTier != null) {
+                    result = blastTier; // 高炉材料只看高炉配方档(0 = 最低压高炉,不乘)
+                    voltageTierMemo.put(key, result);
+                    return result;
+                }
+            }
+            // 非高炉材料:回落 该锭机器配方(回收排除)EUt 档最低值
+            List<EmcRecipe> list = producers.get(key);
+            if (list != null) {
+                int minTier = Integer.MAX_VALUE;
+                boolean anyMachine = false;
+                for (EmcRecipe r : list) {
+                    if (!isMachineRecipe(r)) {
+                        continue;
+                    }
+                    if (r.source != null && r.source.toLowerCase()
+                        .contains("recycl")) {
+                        continue; // 回收防御(收集层已滤 recycle,这里按 source 名再滤一层)
+                    }
+                    anyMachine = true;
+                    // 蒸汽(-1)/ULV(0)配方按 0 计:只有需要 ≥LV 机器才产生补偿
+                    minTier = Math.min(minTier, Math.max(0, r.tier));
+                }
+                if (anyMachine) {
+                    result = minTier;
+                }
+            }
+        }
+        voltageTierMemo.put(key, result);
+        return result;
+    }
+
+    /**
+     * 该产者是否为"GT 机器/装配线"配方(RecipeMap mapName 或 assemblyline):工作台
+     * (crafting)/原版熔炉(smelting)/大工作台(avaritia)没有电压概念,不计入锭的电压档。
+     */
+    private static boolean isMachineRecipe(EmcRecipe r) {
+        if (r == null || r.source == null) {
+            return false;
+        }
+        String s = r.source;
+        return !("crafting".equals(s) || "smelting".equals(s) || "avaritia".equals(s));
+    }
+
+    /** value × 2^n,钳制到 Integer.MAX_VALUE - 1(n≤0 原样返回)。 */
+    private static int scaleUp(int value, int n) {
+        if (value <= 0 || n <= 0) {
+            return value;
+        }
+        long r = (long) value << Math.min(n, 30);
+        return (int) Math.min(Integer.MAX_VALUE - 1, r);
+    }
+
+    /**
+     * 材料族电压补偿(质量种子阶段):种子直接 known.put 定价,不经 {@link #eval} 的放大钩子。
+     * 这里在注入种子后、主求值循环前,把"该材料被补偿"(材料代表锭有 GT 机器配方、n>0)的
+     * 材料其**全套形态种子**(锭/热锭/粉/板/杆/线/块…)按同一 n 等比放大 —— 族内比价不变,
+     * 主循环里所有以这些形态为输入的配方自动读到放大后的价。返回本次改动的种子条数。
+     */
+    public int scaleSeededVoltageFamilies() {
+        int scaled = 0;
+        if (seeded.isEmpty()) {
+            return 0;
+        }
+        for (ItemKey key : new ArrayList<>(seeded.keySet())) {
+            if (key == null) {
+                continue;
+            }
+            // 族系数 = 材料"代表锭"(普通锭,回落热锭)的 n;材料没有锭形态则整个族不乘
+            ItemKey rep = GtMachines.canonicalIngotKey(key);
+            if (rep == null) {
+                continue;
+            }
+            int n = ingotVoltageTier(rep);
+            if (n <= 0) {
+                continue;
+            }
+            Integer v = known.get(key);
+            if (v == null || v <= 0) {
+                continue;
+            }
+            int nv = scaleUp(v, n);
+            if (nv != v) {
+                known.put(key, nv);
+                scaled++;
+            }
+            if (key.equals(rep)) {
+                voltageScaledIngots.add(key);
+            }
+        }
+        return scaled;
+    }
+
+    /**
+     * 粉随锭(收尾):所有求值/重估完成后,把"材料代表锭"(普通锭,材料只有热锭时回落热锭)的
+     * 补偿后价镜像到同材料满粉 —— 种子族已在 scaleSeededVoltageFamilies 等比放大,粉锭同价;
+     * 这里兜锭走配方求值(无组分异星材料等)或锭/粉机器配方档位不同的細差,保证 粉 = 锭价,
+     * 不出现"买粉铸造/熔炼成锭"的 EMC 套利。只镜像本次实际被补偿过的锭。PE/玩家锚点不动。
+     * 返回改动的粉条数。
+     */
+    public int mirrorDustPrices() {
+        int changed = 0;
+        for (ItemKey key : new ArrayList<>(known.keySet())) {
+            // 只镜像"该材料的代表锭"(普通锭;材料只有热锭时回落热锭),且本次实际被补偿过:
+            // 粉 = 代表锭的补偿后价,不随材料里另一形态(如热锭)的独立档位抖动。
+            if (key == null || !voltageScaledIngots.contains(key) || !GtMachines.isIngotItem(key)) {
+                continue;
+            }
+            ItemKey canonical = GtMachines.canonicalIngotKey(key);
+            if (canonical == null || !canonical.equals(key)) {
+                continue;
+            }
+            Integer ingotValue = known.get(key);
+            if (ingotValue == null || ingotValue <= 0 || peHas(key)) {
+                continue;
+            }
+            ItemKey dustKey = GtMachines.fullDustKey(key);
+            if (dustKey == null || dustKey.equals(key) || peHas(dustKey)) {
+                continue;
+            }
+            Integer old = known.get(dustKey);
+            if (old == null || old != ingotValue) {
+                known.put(dustKey, ingotValue);
+                changed++;
+            }
+        }
+        return changed;
     }
 
     /**

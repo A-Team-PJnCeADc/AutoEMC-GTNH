@@ -219,6 +219,111 @@ public final class GtMachines {
         }
     }
 
+    /** GT 材料关联(prefix+material);非 GT 材料物品/异常返回 null。 */
+    public static ItemData association(ItemKey key) {
+        if (!available() || key == null || key.item == null) {
+            return null;
+        }
+        try {
+            ItemData d = GTOreDictUnificator.getAssociation(key.toStack());
+            if (d == null || d.mPrefix == null || d.mMaterial == null || d.mMaterial.mMaterial == null) {
+                return null;
+            }
+            return d;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 锭/热锭(前缀 ingot / ingotHot) */
+    public static boolean isIngotItem(ItemKey key) {
+        ItemData d = association(key);
+        return d != null && (d.mPrefix == OrePrefixes.ingot || d.mPrefix == OrePrefixes.ingotHot);
+    }
+
+    /** 满粉(前缀 dust,不含小堆粉/小撮粉) */
+    public static boolean isFullDustItem(ItemKey key) {
+        ItemData d = association(key);
+        return d != null && d.mPrefix == OrePrefixes.dust;
+    }
+
+    /** 某材料物品的同材料普通锭 key(材料没有锭则回落热锭;都没有返回 null)。 */
+    public static ItemKey canonicalIngotKey(ItemKey any) {
+        ItemData d = association(any);
+        if (d == null) {
+            return null;
+        }
+        try {
+            ItemStack s = GTOreDictUnificator.get(OrePrefixes.ingot, d.mMaterial.mMaterial, 1);
+            if (s == null || s.getItem() == null) {
+                s = GTOreDictUnificator.get(OrePrefixes.ingotHot, d.mMaterial.mMaterial, 1);
+            }
+            return (s == null || s.getItem() == null) ? null : ItemKey.of(s);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 某材料物品的同材料满粉 key(材料没有满粉形态返回 null)。 */
+    public static ItemKey fullDustKey(ItemKey any) {
+        ItemData d = association(any);
+        if (d == null) {
+            return null;
+        }
+        try {
+            ItemStack s = GTOreDictUnificator.get(OrePrefixes.dust, d.mMaterial.mMaterial, 1);
+            return (s == null || s.getItem() == null) ? null : ItemKey.of(s);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 一次全量扫描 producers,构建"材料代表锭 key -> 该材料 blast furnace 产者配方(EUt 电压档)
+     * 最小值"映射:只要材料存在高炉配方产出其锭/热锭(含 BlastFurnaceWithGas 等 map 名带
+     * blastfurnace 的机器,直接出锭或出热锭都算),就记一条 —— 用于锭补偿系数 n 的高炉优先。
+     * 回收类配方(收集层已滤,此处按 source 名再防御)不参与。无高炉配方的材料不出现在结果里
+     * (调用方回落机器配方电压档)。
+     */
+    public static Map<ItemKey, Integer> blastFurnaceMinTierByIngot(Map<ItemKey, List<EmcRecipe>> producers) {
+        Map<ItemKey, Integer> out = new HashMap<>();
+        if (!available() || producers == null) {
+            return out;
+        }
+        try {
+            for (Map.Entry<ItemKey, List<EmcRecipe>> e : producers.entrySet()) {
+                List<EmcRecipe> list = e.getValue();
+                if (list == null) {
+                    continue;
+                }
+                for (EmcRecipe r : list) {
+                    if (r == null || r.source == null) {
+                        continue;
+                    }
+                    String src = r.source.toLowerCase();
+                    if (!src.contains("blastfurnace")) {
+                        continue;
+                    }
+                    if (src.contains("recycl")) {
+                        continue; // 回收防御
+                    }
+                    ItemKey rep = canonicalIngotKey(r.output);
+                    if (rep == null) {
+                        continue;
+                    }
+                    int tier = Math.max(0, r.tier);
+                    Integer old = out.get(rep);
+                    if (old == null || tier < old) {
+                        out.put(rep, tier);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // 扫描失败 -> 空表(全部按非高炉材料回落处理)
+        }
+        return out;
+    }
+
     /** 一个 circuit* oredict 的全部有效成员栈(剔除 null / wildcard / 一次性工具);GT 未加载返回空表 */
     public static List<ItemStack> circuitOredictMembers(String oreName) {
         List<ItemStack> out = new ArrayList<>();

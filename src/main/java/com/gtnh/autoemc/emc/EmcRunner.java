@@ -253,6 +253,14 @@ public final class EmcRunner {
             LOG.info("GT material mass-seeding (mass*72, GTMoreEMC form table): seeded {} form values.", seededCount);
         }
 
+        // 材料族电压补偿(规则:全套形态 ×2^n,n = 材料代表锭的 GT 机器配方电压最低档,蒸汽/ULV
+        // 按 0;无机器配方的锭不乘)。种子直接定价不走 eval 钩子,这里把被补偿材料的全套形态种子
+        // (锭/热锭/粉/板/杆/线/块…)等比放大 —— 主求值循环里所有以它们为输入的配方自动读到放大价。
+        int ingotScaled = engine.scaleSeededVoltageFamilies();
+        if (ingotScaled > 0) {
+            LOG.info("Voltage-tier material compensation (x2^tier): scaled {} seeded form values.", ingotScaled);
+        }
+
         int computed = 0;
         int zeroValued = 0;
         for (ItemKey key : producers.keySet()) {
@@ -305,6 +313,16 @@ public final class EmcRunner {
                 "Fluid-cost second pass (fluid inputs now valued): recomputed {} item values; {} fluid values resolved.",
                 fluidRecomputed,
                 engine.fluidValueCount());
+        }
+
+        // 粉随锭(规则收尾):把"材料代表锭"的补偿后价镜像到同材料满粉,防"买粉铸造/熔炼成锭"
+        // 按锭价套 EMC(锭与粉的机器配方档位可能不同,价会出现细差)。中间形态(板/杆/线/块…)
+        // 已在种子族等比放大,这里不需要再处理。
+        int dustMirrored = engine.mirrorDustPrices();
+        if (dustMirrored > 0) {
+            LOG.info(
+                "Voltage-tier material compensation: mirrored {} full-dust values to their (x2^tier) ingot price.",
+                dustMirrored);
         }
 
         Map<ItemKey, Integer> finalValues = engine.collectFinalValues();

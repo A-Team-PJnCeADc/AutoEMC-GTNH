@@ -1,10 +1,11 @@
 package com.gtnh.autoemc.mixins;
 
+import javax.annotation.Nonnull;
+
 import com.gtnewhorizon.gtnhmixins.builders.IMixins;
 import com.gtnewhorizon.gtnhmixins.builders.MixinBuilder;
-import cpw.mods.fml.common.Loader;
 
-import javax.annotation.Nonnull;
+import cpw.mods.fml.common.Loader;
 
 /**
  * 本 mod 的全部 mixin 声明(GTNH IMixins 方式)。早/晚(mixin 注入 Minecraft/Forge vs 注入普通 mod 类)都在

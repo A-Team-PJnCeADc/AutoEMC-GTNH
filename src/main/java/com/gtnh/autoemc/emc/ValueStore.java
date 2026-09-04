@@ -34,7 +34,7 @@ import com.gtnh.autoemc.api.recipe.RecipeSource;
 public final class ValueStore {
 
     /** 公式语义版本:改了求值规则就 +1,强制全量重算 */
-    public static final int FORMULA_VERSION = 20;
+    public static final int FORMULA_VERSION = 23;
     private static final int SCHEMA = 2;
 
     private static final Pattern FINGERPRINT_PATTERN = Pattern.compile("\"fingerprint\"\\s*:\\s*\"([0-9a-f]{16,64})\"");
