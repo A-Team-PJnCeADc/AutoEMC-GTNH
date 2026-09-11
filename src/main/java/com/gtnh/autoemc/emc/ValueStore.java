@@ -8,6 +8,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -24,8 +25,8 @@ import com.gtnh.autoemc.api.recipe.RecipeSource;
 
 /**
  * emc-values.json 本地缓存。
- * 结构:{"schemaVersion":2,"fingerprint":"<sha256>","values":{"注册名@damage":emc,...},
- * "chains":{"注册名@damage":["child1",...],...}}
+ * 结构:{"schemaVersion":2,"fingerprint":"<sha256>","values":{"注册名@damage":emc,…},
+ * "chains":{"注册名@damage":["child1",…],…}}
  * values:启动时若指纹一致则预载这些值,只计算缺少的物品(diff),不从头全量求值。
  * chains:每个 AutoEMC 定价物品「引擎选中配方各输入槽取用的物品」,与值配套,供
  * /projecte_autoemc view 回放对齐链。链跨指纹累积:值一旦进 PE/缓存即不再重算,
@@ -33,8 +34,8 @@ import com.gtnh.autoemc.api.recipe.RecipeSource;
  */
 public final class ValueStore {
 
-    /** 公式语义版本:改了求值规则就 +1,强制全量重算 */
-    public static final int FORMULA_VERSION = 23;
+    /** 公式语义版本:改了求值规则就 +1,强制全量重算(24:EMC 值域 int -> BigInteger,旧的被夹取缓存失效) */
+    public static final int FORMULA_VERSION = 24;
     private static final int SCHEMA = 2;
 
     private static final Pattern FINGERPRINT_PATTERN = Pattern.compile("\"fingerprint\"\\s*:\\s*\"([0-9a-f]{16,64})\"");
@@ -104,9 +105,12 @@ public final class ValueStore {
         return m.find() ? m.group(1) : "";
     }
 
-    /** 读缓存值;文件缺失/损坏/条目物品不存在则跳过。返回空表而非异常 */
-    public static Map<ItemKey, Integer> load(File file) {
-        Map<ItemKey, Integer> values = new HashMap<>();
+    /**
+     * 读缓存值;文件缺失/损坏/条目物品不存在则跳过。返回空表而非异常。
+     * 值用 EmcMath.parse 解析:新缓存的十进制字符串与旧缓存的 int 字面量都能读(向后兼容)。
+     */
+    public static Map<ItemKey, BigInteger> load(File file) {
+        Map<ItemKey, BigInteger> values = new HashMap<>();
         String content = readFile(file);
         if (content == null) {
             return values;
@@ -114,13 +118,8 @@ public final class ValueStore {
         Matcher m = ENTRY_PATTERN.matcher(content);
         while (m.find()) {
             String key = m.group(1);
-            int value;
-            try {
-                value = Integer.parseInt(m.group(2));
-            } catch (NumberFormatException e) {
-                continue;
-            }
-            if (value <= 0) {
+            BigInteger value = EmcMath.parse(m.group(2));
+            if (value == null || value.signum() <= 0) {
                 continue;
             }
             ItemKey itemKey = parseKey(key);
@@ -231,18 +230,19 @@ public final class ValueStore {
         return new ItemKey((Item) obj, damage);
     }
 
-    /** 写缓存(values 只存 >0 的;chains 只存有输入的条目,格式 child*qty) */
-    public static void save(File file, String fingerprint, Map<ItemKey, Integer> values,
+    /** 写缓存(values 只存 >0 的,十进制文本;chains 只存有输入的条目,格式 child*qty) */
+    public static void save(File file, String fingerprint, Map<ItemKey, BigInteger> values,
         Map<ItemKey, List<Pick>> chains) {
         try {
             File parent = file.getParentFile();
             if (parent != null && !parent.exists() && !parent.mkdirs()) {
                 return;
             }
-            TreeMap<String, Integer> sorted = new TreeMap<>();
-            for (Map.Entry<ItemKey, Integer> e : values.entrySet()) {
-                if (e.getValue() > 0) {
-                    sorted.put(keyOf(e.getKey()), e.getValue());
+            TreeMap<String, BigInteger> sorted = new TreeMap<>();
+            for (Map.Entry<ItemKey, BigInteger> e : values.entrySet()) {
+                BigInteger v = e.getValue();
+                if (EmcMath.isPositive(v)) {
+                    sorted.put(keyOf(e.getKey()), v);
                 }
             }
             TreeMap<String, List<String>> sortedChains = new TreeMap<>();
@@ -270,7 +270,7 @@ public final class ValueStore {
                 .append("\",\n");
             sb.append("  \"values\": {");
             boolean first = true;
-            for (Map.Entry<String, Integer> e : sorted.entrySet()) {
+            for (Map.Entry<String, BigInteger> e : sorted.entrySet()) {
                 if (!first) {
                     sb.append(',');
                 }
@@ -279,7 +279,10 @@ public final class ValueStore {
                     .append("    \"")
                     .append(e.getKey())
                     .append("\": ")
-                    .append(e.getValue());
+                    // BigInteger 的 toString 就是纯十进制(无千分位)
+                    .append(
+                        e.getValue()
+                            .toString());
             }
             if (!first) {
                 sb.append('\n');

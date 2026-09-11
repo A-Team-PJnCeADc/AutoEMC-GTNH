@@ -25,7 +25,7 @@ public final class EmcRecipe {
     public final List<FluidUse> fluids;
     /** CAT_* 常量 */
     public final int category;
-    /** TIER_STEAM=-1,否则为电压等级索引(0=ULV,1=LV,...) */
+    /** TIER_STEAM=-1,否则为电压等级索引(0=ULV,1=LV,…) */
     public final int tier;
     /** 配方来源,仅用于日志/排查,如 "crafting"、"smelting"、"gt.recipe.macerator" */
     public final String source;

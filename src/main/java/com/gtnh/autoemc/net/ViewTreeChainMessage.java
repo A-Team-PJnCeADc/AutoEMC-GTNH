@@ -16,7 +16,7 @@ import io.netty.buffer.ByteBuf;
  * S2C:AutoEMC 对齐链(分片发送,防止超包)。
  *
  * 每片携带 total/chunk 序号与若干"节点行";节点行格式:
- * &lt;stackKey&gt;|&lt;childKey1&gt;|&lt;childKey2&gt;...(stackKey = 注册名@meta)
+ * &lt;stackKey&gt;|&lt;childKey1&gt;|&lt;childKey2&gt;…(stackKey = 注册名@meta)
  * 行内以 '|' 分隔,children 可能为空。客户端收齐后组装成 ViewRequest 并打开对齐的配方树。
  */
 public class ViewTreeChainMessage implements IMessage {

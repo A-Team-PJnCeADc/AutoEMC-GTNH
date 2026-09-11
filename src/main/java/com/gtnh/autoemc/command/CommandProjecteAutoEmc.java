@@ -1,5 +1,6 @@
 package com.gtnh.autoemc.command;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -11,6 +12,7 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.util.ChatComponentText;
 
 import com.gtnh.autoemc.api.recipe.RecipeSource;
+import com.gtnh.autoemc.compat.ProjectExpansionCompat;
 import com.gtnh.autoemc.emc.EmcRuntime;
 import com.gtnh.autoemc.emc.EmcRuntime.ChainItem;
 import com.gtnh.autoemc.emc.ItemKey;
@@ -86,11 +88,24 @@ public class CommandProjecteAutoEmc extends CommandBase {
         ItemKey targetKey = ItemKey.of(target);
         String info = EmcRuntime.describe(targetKey);
         if (info == null) {
-            // EmcRuntime 只有最近一次 run 的新值;AutoEMC 已定价(PE 锚定)的物品从 PE 现查
+            // EmcRuntime 只保存最近一次 run 的新值;已定价的物品按精确度依次往后退:
+            // PE-E-GTNH 的精确表(精确 BigInteger,不受 PE 的 int 表 21 亿限制)
+            BigInteger exact = ProjectExpansionCompat.exactValue(target);
+            if (exact != null) {
+                info = "EMC=" + exact
+                    + (exact.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0 ? " (精确值,超过 ProjectE int 表上限)" : "")
+                    + ", 来源=PE-E-GTNH 精确表";
+            }
+        }
+        if (info == null) {
+            // 最后才退回 ProjectE 自己的 int 表(超过 21 亿的物品这里只会显示 2147483647)
             try {
                 moze_intel.projecte.api.proxy.IEMCProxy proxy = moze_intel.projecte.api.ProjectEAPI.getEMCProxy();
                 if (proxy != null && proxy.hasValue(target)) {
-                    info = "EMC=" + proxy.getValue(target) + ", 来源=ProjectE";
+                    info = "EMC=" + proxy.getValue(target)
+                        + (proxy.getValue(target) >= Integer.MAX_VALUE - 1 ? " (ProjectE 的 int 表上限,精确值请装 PE-E-GTNH)"
+                            : "")
+                        + ", 来源=ProjectE";
                 }
             } catch (Throwable ignored) {
                 // 查询失败就不显示 EMC 信息
@@ -129,7 +144,7 @@ public class CommandProjecteAutoEmc extends CommandBase {
         }
         List<String> lines = new ArrayList<>(chain.size());
         for (ChainItem item : chain) {
-            // 节点行:key|source|outQty|child1*qty1|child2*qty2|...
+            // 节点行:key|source|outQty|child1*qty1|child2*qty2|…
             StringBuilder sb = new StringBuilder(keyOf(item.key.toStack()));
             sb.append('|')
                 .append(sanitize(item.source))

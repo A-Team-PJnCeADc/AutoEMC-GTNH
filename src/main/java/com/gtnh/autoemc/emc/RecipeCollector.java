@@ -126,9 +126,7 @@ public final class RecipeCollector {
         }
     }
 
-    // ============================================================
     // 源 1:工作台合成
-    // ============================================================
 
     private static final class CraftingSource implements RecipeSource {
 
@@ -406,9 +404,7 @@ public final class RecipeCollector {
         }
     }
 
-    // ============================================================
     // 源 2:原版熔炉冶炼
-    // ============================================================
 
     private static final class SmeltingSource implements RecipeSource {
 
@@ -486,9 +482,7 @@ public final class RecipeCollector {
         }
     }
 
-    // ============================================================
     // 源 3:GT 机器配方
-    // ============================================================
 
     private static final class GtSource implements RecipeSource {
 
@@ -526,9 +520,7 @@ public final class RecipeCollector {
         }
     }
 
-    // ============================================================
     // 源 4:GT 装配线(Assembly Line,数据棒注册表,不走 RecipeMap)
-    // ============================================================
 
     private static final class AssemblyLineSource implements RecipeSource {
 
@@ -559,9 +551,7 @@ public final class RecipeCollector {
         }
     }
 
-    // ============================================================
     // 源 5:Avaritia 大工作台(ExtremeCraftingManager,每格 1 材料)
-    // ============================================================
 
     private static final class AvaritiaSource implements RecipeSource {
 

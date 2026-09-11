@@ -1,5 +1,6 @@
 package com.gtnh.autoemc.emc;
 
+import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -14,6 +15,7 @@ import net.minecraftforge.fluids.FluidRegistry;
 import net.minecraftforge.oredict.OreDictionary;
 
 import com.gtnh.autoemc.api.registry.EmcRegistry;
+import com.gtnh.autoemc.compat.ProjectExpansionCompat;
 
 import moze_intel.projecte.api.proxy.IEMCProxy;
 
@@ -33,13 +35,14 @@ import moze_intel.projecte.api.proxy.IEMCProxy;
  */
 public final class EmcEngine {
 
-    /** 该值仅表示"递归进行中不可用"的边,不对外暴露 */
-    private static final int UNKNOWN = -1;
+    // 未知(原 int 版的哨兵 UNKNOWN = -1)在本引擎内部统一用 BigInteger 的 null 表示:
+    // 任何 EMC 运算遇 null 一律传播为 null,绝不当作 0 参与计算。
 
     /** 地下流体兜底价:无法从锭/配方推导的流体按 1 L(mB)=1 EMC,即每 144L = 144。 */
-    private static final long FLUID_UNDERGROUND_PER_144L = 144L;
+    private static final BigInteger FLUID_UNDERGROUND_PER_144L = BigInteger.valueOf(144L);
 
     private final Map<ItemKey, List<EmcRecipe>> producers;
+
     private final IEMCProxy proxy;
 
     /** 流体反推产者表:fluidName -> 产出它的"零物品输出、单一流体输出"配方(可能为空) */
@@ -47,16 +50,16 @@ public final class EmcEngine {
 
     /**
      * 已解析流体价值(每 144L 的 EMC;0 也缓存=免费,如无产者且非材料的流体)。
-     * UNKNOWN(-1)不缓存 —— 递归环上的流体下次重试;resolveDeferred/fluidRecompute
+     * 未知(null)不缓存 —— 递归环上的流体下次重试;resolveDeferred/fluidRecompute
      * 会清掉 0 缓存让基础定价后的重估重算。
      */
-    private final Map<String, Long> fluidMemo = new HashMap<>();
+    private final Map<String, BigInteger> fluidMemo = new HashMap<>();
 
     /** 流体递归环检测栈(流体->流体/流体->物品->流体),与物品求值栈配合防跨类环 */
     private final Deque<String> fluidStack = new ArrayDeque<>();
 
-    /** 所有已求出的值(锚点/预载缓存/新算) */
-    private final Map<ItemKey, Integer> known = new HashMap<>();
+    /** 所有已求出的值(锚点/预载缓存/新算);EMC 值一律 BigInteger,未知(null)不落表 */
+    private final Map<ItemKey, BigInteger> known = new HashMap<>();
     /** 预载缓存(JSON)里已有的 key,用于统计"本次新增" */
     private final java.util.Set<ItemKey> preloaded = new java.util.HashSet<>();
     /** PE hasValue 记忆 */
@@ -68,7 +71,7 @@ public final class EmcEngine {
     /** 按"同级平均"定价的假电路板(无产出配方,非 producers 成员;最终值同样要注册) */
     private final Set<ItemKey> circuitAveraged = new HashSet<>();
     /** GTMoreEMC mass-seeding:GT material forms priced directly (mass*72*form multiplier). */
-    private final Map<ItemKey, Integer> seeded = new HashMap<>();
+    private final Map<ItemKey, BigInteger> seeded = new HashMap<>();
     /**
      * 锭/热锭的"材料族补偿档 n"(规则:全套形态价 ×2^n):
      * ① 材料存在 blast furnace 产者配方(直接产锭或产热锭,map 名含 blastfurnace,回收类排除)
@@ -95,12 +98,13 @@ public final class EmcEngine {
     }
 
     /** 把上次缓存的值(数量>0)预载为已知,不求值它们;已被 PE(含玩家手动)定价的跳过 */
-    public void preload(Map<ItemKey, Integer> cached) {
-        for (Map.Entry<ItemKey, Integer> e : cached.entrySet()) {
-            if (e.getValue() <= 0 || peHas(e.getKey())) {
+    public void preload(Map<ItemKey, BigInteger> cached) {
+        for (Map.Entry<ItemKey, BigInteger> e : cached.entrySet()) {
+            BigInteger v = e.getValue();
+            if (!EmcMath.isPositive(v) || peHas(e.getKey())) {
                 continue;
             }
-            known.put(e.getKey(), e.getValue());
+            known.put(e.getKey(), v);
             preloaded.add(e.getKey());
         }
     }
@@ -114,11 +118,11 @@ public final class EmcEngine {
      * 质量×72×形态系数定值(known 命中优先于配方求值),不覆盖 PE 已锚定的物品。
      * 返回实际注入条数(>0 且非 PE 锚点)。
      */
-    public int addSeeds(Map<ItemKey, Integer> seeds) {
+    public int addSeeds(Map<ItemKey, BigInteger> seeds) {
         int added = 0;
-        for (Map.Entry<ItemKey, Integer> e : seeds.entrySet()) {
-            Integer v = e.getValue();
-            if (v == null || v <= 0) {
+        for (Map.Entry<ItemKey, BigInteger> e : seeds.entrySet()) {
+            BigInteger v = e.getValue();
+            if (!EmcMath.isPositive(v)) {
                 continue;
             }
             if (peHas(e.getKey())) {
@@ -150,56 +154,71 @@ public final class EmcEngine {
         return pickedOptions.get(key);
     }
 
-    public Integer knownValue(ItemKey key) {
+    /** 已求出的 EMC 值;null 表示尚无记录(与"未知"哨兵语义一致:都没有值) */
+    public BigInteger knownValue(ItemKey key) {
         return known.get(key);
     }
 
     private boolean peHas(ItemKey key) {
         Boolean b = peHasCache.get(key);
         if (b == null) {
-            b = proxy.hasValue(key.toStack());
+            // PE-E-GTNH(装了就优先问它):它的 BigInteger 表里有价也算有
+            b = proxy.hasValue(key.toStack()) || ProjectExpansionCompat.hasExactValue(key.toStack());
             peHasCache.put(key, b);
         }
         return b;
     }
 
-    private int peValue(ItemKey key) {
+    /**
+     * 读 ProjectE(或 PE-E-GTNH 精确表)已有价值,作为锚点。
+     * 装了 PE-E-GTNH 时优先用它的 BigInteger 精确值:ProjectE 的 int 表会把高价物品夹在 21 亿,
+     * 而 GT 物品常参与高阶配方,截断会污染求值 —— 改造后精确值原样进入引擎,不再夹取。
+     * 没有精确值时读 ProjectE 的 int 表(这里本来就是 int 域):负值按 0。
+     */
+    private BigInteger peValue(ItemKey key) {
         ItemStack stack = key.toStack();
-        int v = proxy.getValue(stack);
-        return Math.max(0, v);
+        BigInteger exact = ProjectExpansionCompat.exactValue(stack);
+        if (exact != null) {
+            return EmcMath.max(exact, BigInteger.ZERO);
+        }
+        BigInteger v = EmcMath.of(proxy.getValue(stack));
+        return v == null ? BigInteger.ZERO : v;
     }
 
-    /** 目标物品求值:永不返回 UNKNOWN,最后兜底 0 */
-    public int evalTarget(ItemKey key) {
-        int v = eval(key, new ArrayDeque<>());
-        return v == UNKNOWN ? 0 : v;
+    /** 目标物品求值:永不返回"未知",最后兜底 0 */
+    public BigInteger evalTarget(ItemKey key) {
+        BigInteger v = eval(key, new ArrayDeque<>());
+        return v == null ? BigInteger.ZERO : v;
     }
 
     /**
      * 供 GtMachines 份量折算递归使用。共享外层求值栈:这样 粉↔小撮粉 之类的折算环
-     * 会被 stack.contains 正确判为环返回 UNKNOWN,而不是用独立新栈绕过环检测无限递归
-     * (StackOverflowError)。返回 0 = 当前环上无法折算。
+     * 会被 stack.contains 正确判为环返回未知(null),而不是用独立新栈绕过环检测无限递归
+     * (StackOverflowError)。返回 null = 当前环上无法折算(原 int 版返回 0)。
      */
-    public int evalFraction(ItemKey key, Deque<ItemKey> stack) {
-        int v = eval(key, stack);
-        return v == UNKNOWN ? 0 : v;
+    public BigInteger evalFraction(ItemKey key, Deque<ItemKey> stack) {
+        return eval(key, stack);
     }
 
-    /** 返回 UNKNOWN 仅表示当前递归路径上的环;≥0 表示已定值(含 0) */
-    private int eval(ItemKey key, Deque<ItemKey> stack) {
-        Integer cached = known.get(key);
+    /** 返回 null 仅表示当前递归路径上的环;非 null 表示已定值(含 0) */
+    private BigInteger eval(ItemKey key, Deque<ItemKey> stack) {
+        BigInteger cached = known.get(key);
         if (cached != null) {
             return cached;
         }
         if (peHas(key)) {
-            int v = peValue(key);
+            BigInteger v = peValue(key);
             known.put(key, v);
             return v;
         }
         // 份量形态(粉/小撮粉/小堆粉/粒/螺栓/螺丝):直接按材料份量折算,不展开配方,
         // 结果缓存到 known 复用(最大的粉=锭、螺栓/螺丝=杆/2)。
         if (GtMachines.isFractionForm(key)) {
-            int v = GtMachines.materialFractionValue(key, this, stack);
+            // 折算不可用(null)与原来的 0 等价:缓存 0,由 resolveDeferred 第二遍重估
+            BigInteger v = GtMachines.materialFractionValue(key, this, stack);
+            if (v == null) {
+                v = BigInteger.ZERO;
+            }
             known.put(key, v);
             return v;
         }
@@ -209,33 +228,36 @@ public final class EmcEngine {
             // 再试"假电路板"平均价——circuit<等级> oredict 成员(如 dreamcraft CircuitMV)没有
             // 任何产出配方,价格 = 同 oredict 其他有价成员的平均(规则:任意电路板价格 =
             // 同等级电路板总价/数量,只对无价成员生效)。共享当前栈以保留环检测
-            // (假电路之间互相求平均的环返回 UNKNOWN)。
-            int v = GtMachines.materialFractionValue(key, this, stack);
-            if (v <= 0 && GtMachines.isCircuitBoardKey(key)) {
+            // (假电路之间互相求平均的环返回未知(null))。
+            BigInteger v = GtMachines.materialFractionValue(key, this, stack);
+            if (!EmcMath.isPositive(v) && GtMachines.isCircuitBoardKey(key)) {
                 if (stack.contains(key)) {
-                    return UNKNOWN;
+                    return null;
                 }
                 stack.addLast(key);
                 v = GtMachines.circuitBoardAverage(key, this, stack);
                 stack.removeLast();
-                if (v > 0) {
+                if (EmcMath.isPositive(v)) {
                     circuitAveraged.add(key);
                     known.put(key, v);
                     return v;
                 }
-                // 是电路板但同级暂无有价成员(顺序依赖):不缓存 0、返回 UNKNOWN,
+                // 是电路板但同级暂无有价成员(顺序依赖):不缓存 0、返回"未知"(null),
                 // 由 resolveCircuitBoards()/resolveDeferred() 在基础成员定价后重估。
-                return UNKNOWN;
+                return null;
+            }
+            if (v == null) {
+                v = BigInteger.ZERO;
             }
             known.put(key, v);
             return v;
         }
         if (stack.contains(key)) {
-            return UNKNOWN;
+            return null;
         }
         stack.addLast(key);
         EmcRecipe best = null;
-        long bestUnitCost = 0;
+        BigInteger bestUnitCost = null;
         boolean bestPositive = false;
         boolean bestFreeInput = false;
         List<Pick> bestPicks = null;
@@ -243,19 +265,19 @@ public final class EmcEngine {
         // 压过精宝石/切割等其他产法);不存在时退回常规选择。
         boolean lensOutput = GtMachines.isLensKey(key);
         EmcRecipe bestLathe = null;
-        long latheUnitCost = 0;
+        BigInteger latheUnitCost = null;
         boolean lathePositive = false;
         boolean latheFreeInput = false;
         List<Pick> lathePicks = null;
         List<Pick> tmpPicks = new ArrayList<>();
         for (EmcRecipe r : list) {
             tmpPicks.clear();
-            long cost = costOf(r, stack, tmpPicks);
-            if (cost < 0) {
-                continue;
+            BigInteger cost = costOf(r, stack, tmpPicks);
+            if (cost == null) {
+                continue; // 当前递归路径上不可解析(环),换下一条候选
             }
-            long unitCost = cost / Math.max(1, r.outputQty);
-            boolean positive = cost > 0;
+            BigInteger unitCost = EmcMath.div(cost, Math.max(1, r.outputQty));
+            boolean positive = EmcMath.isPositive(cost);
             // 含无价输入的配方让位给全有价输入的配方:同一产物常有多个配方,其中某条吃到的材料
             // 没价(如硅压印板 7 个蚀刻配方各吃一颗不同透镜,无价透镜按 0 计入成本会让那条看起来
             // 最便宜而被选中、树里出现无价材料;盐等跨 mod 同材料同理)。优先级:正成本 > 零成本,
@@ -319,10 +341,11 @@ public final class EmcEngine {
             // 所有配方都因环失效(无逃逸):先按 0 缓存,保证第一遍全量 memoization、不重算。
             // 顺序依赖导致的 sticky-0(本物品其实有正值、只因基础配方还没被求出)由
             // resolveDeferred() 第二遍重估修正。
-            known.put(key, 0);
-            return 0;
+            known.put(key, BigInteger.ZERO);
+            return BigInteger.ZERO;
         }
-        int value = (int) Math.min(Integer.MAX_VALUE - 1, Math.max(0, bestUnitCost));
+        // 单位成本即物品价;BigInteger 不再被 ProjectE 的 21 亿夹取(只在写回边界收敛)
+        BigInteger value = EmcMath.max(bestUnitCost, BigInteger.ZERO);
         // 材料族电压补偿(规则:全套形态价 ×2^n)。n 见 ingotVoltageTier:高炉材料取该材料
         // blast furnace 产者配方的 EUt 档最小值(回收排除);无高炉配方材料取锭机器配方 EUt 档
         // 最低值。种子形态在 scaleSeededVoltageFamilies 已放大;这里兜配方求值的锭/热锭(无组分
@@ -331,7 +354,7 @@ public final class EmcEngine {
         // PE/玩家锚点锭走上面 peHas 分支,不进这里,不被改。
         ItemKey ingotRep = GtMachines.canonicalIngotKey(key);
         int ingotTierN = ingotRep == null ? -1 : ingotVoltageTier(ingotRep);
-        if (ingotTierN > 0 && value > 0) {
+        if (ingotTierN > 0 && EmcMath.isPositive(value)) {
             value = scaleUp(value, ingotTierN);
             if (key.equals(ingotRep)) {
                 voltageScaledIngots.add(key);
@@ -402,13 +425,12 @@ public final class EmcEngine {
         return !("crafting".equals(s) || "smelting".equals(s) || "avaritia".equals(s));
     }
 
-    /** value × 2^n,钳制到 Integer.MAX_VALUE - 1(n≤0 原样返回)。 */
-    private static int scaleUp(int value, int n) {
-        if (value <= 0 || n <= 0) {
+    /** value × 2^n(n≤0 或未知原样返回);BigInteger 版不再钳到 Integer.MAX_VALUE - 1。 */
+    private static BigInteger scaleUp(BigInteger value, int n) {
+        if (!EmcMath.isPositive(value) || n <= 0) {
             return value;
         }
-        long r = (long) value << Math.min(n, 30);
-        return (int) Math.min(Integer.MAX_VALUE - 1, r);
+        return value.shiftLeft(Math.min(n, 30));
     }
 
     /**
@@ -435,12 +457,12 @@ public final class EmcEngine {
             if (n <= 0) {
                 continue;
             }
-            Integer v = known.get(key);
-            if (v == null || v <= 0) {
+            BigInteger v = known.get(key);
+            if (!EmcMath.isPositive(v)) {
                 continue;
             }
-            int nv = scaleUp(v, n);
-            if (nv != v) {
+            BigInteger nv = scaleUp(v, n);
+            if (!nv.equals(v)) {
                 known.put(key, nv);
                 scaled++;
             }
@@ -470,16 +492,16 @@ public final class EmcEngine {
             if (canonical == null || !canonical.equals(key)) {
                 continue;
             }
-            Integer ingotValue = known.get(key);
-            if (ingotValue == null || ingotValue <= 0 || peHas(key)) {
+            BigInteger ingotValue = known.get(key);
+            if (!EmcMath.isPositive(ingotValue) || peHas(key)) {
                 continue;
             }
             ItemKey dustKey = GtMachines.fullDustKey(key);
             if (dustKey == null || dustKey.equals(key) || peHas(dustKey)) {
                 continue;
             }
-            Integer old = known.get(dustKey);
-            if (old == null || old != ingotValue) {
+            BigInteger old = known.get(dustKey);
+            if (old == null || !old.equals(ingotValue)) {
                 known.put(dustKey, ingotValue);
                 changed++;
             }
@@ -498,41 +520,41 @@ public final class EmcEngine {
             return false;
         }
         for (EmcIngredient ing : r.inputs) {
-            long minPriced = Long.MAX_VALUE;
+            BigInteger minPriced = null;
             boolean anyOption = false;
             for (ItemKey opt : ing.options) {
-                long v = eval(opt, stack);
-                if (v == UNKNOWN) {
+                BigInteger v = eval(opt, stack);
+                if (v == null) {
                     continue;
                 }
                 anyOption = true;
-                if (v > 0 && v < minPriced) {
+                if (EmcMath.isPositive(v) && (minPriced == null || EmcMath.cmp(v, minPriced) < 0)) {
                     minPriced = v;
                 }
             }
-            if (anyOption && minPriced == Long.MAX_VALUE) {
+            if (anyOption && minPriced == null) {
                 return true; // 该槽没有任何正价选项 -> 落到的就是 0 价物品
             }
         }
         return false;
     }
 
-    private long costOf(EmcRecipe r, Deque<ItemKey> stack, List<Pick> outPicks) {
-        long sum = 0;
+    private BigInteger costOf(EmcRecipe r, Deque<ItemKey> stack, List<Pick> outPicks) {
+        BigInteger sum = BigInteger.ZERO;
         for (EmcIngredient ing : r.inputs) {
-            long bestPriced = Long.MAX_VALUE;
+            BigInteger bestPriced = null;
             ItemKey bestPricedKey = null;
-            long bestFree = Long.MAX_VALUE;
+            BigInteger bestFree = BigInteger.ZERO;
             ItemKey bestFreeKey = null;
             boolean anyOption = false;
             for (ItemKey opt : ing.options) {
-                long v = eval(opt, stack);
-                if (v == UNKNOWN) {
+                BigInteger v = eval(opt, stack);
+                if (v == null) {
                     continue; // 该选项正处在当前递归环上,换下一个选项
                 }
                 anyOption = true;
-                if (v > 0) {
-                    if (v < bestPriced) {
+                if (EmcMath.isPositive(v)) {
+                    if (bestPriced == null || EmcMath.cmp(v, bestPriced) < 0) {
                         bestPriced = v;
                         bestPricedKey = opt;
                     }
@@ -541,55 +563,44 @@ public final class EmcEngine {
                     // 若允许无价副本以 0 压过有价副本,成本会被低估、树里还选中无价物品;
                     // 规则:只要存在有价选项就优先选有价者,全无价才退回 0。
                     if (bestFreeKey == null) {
-                        bestFree = 0;
+                        bestFree = BigInteger.ZERO;
                         bestFreeKey = opt;
                     }
                 }
             }
             if (!anyOption) {
-                return UNKNOWN;
+                return null;
             }
-            long bestOption;
-            ItemKey bestKey;
-            if (bestPricedKey != null) {
-                bestOption = bestPriced;
-                bestKey = bestPricedKey;
-            } else {
-                bestOption = bestFree;
-                bestKey = bestFreeKey;
+            // 有价选项优先;全无价才退回槽里的 0(免费)
+            BigInteger bestOption = bestPricedKey != null ? bestPriced : bestFree;
+            ItemKey bestKey = bestPricedKey != null ? bestPricedKey : bestFreeKey;
+            if (!AutoEmcConfig.unpricedIsZero && !EmcMath.isPositive(bestOption)) {
+                return null; // 不允许把无价材料当 0 用时,这条配方失效
             }
-            if (!AutoEmcConfig.unpricedIsZero && bestOption <= 0) {
-                return UNKNOWN; // 不允许把无价材料当 0 用时,这条配方失效
-            }
-            sum += bestOption * ing.qty;
-            if (sum < 0) {
-                return UNKNOWN; // 溢出保护
-            }
+            // BigInteger 无溢出:原 sum < 0 的溢出保护不再需要
+            sum = EmcMath.add(sum, EmcMath.mul(bestOption, ing.qty));
             outPicks.add(new Pick(bestKey, ing.qty));
         }
         // 流体输入计入成本:每 144L = 流体价值(材料流体 144L=对应锭价;无锭配方反推;免费流体为 0)
         for (FluidUse fu : r.fluids) {
-            long v144 = resolveFluidValue144(fu.fluidName, stack);
-            if (v144 == UNKNOWN) {
-                return UNKNOWN; // 流体价值递归中/当前不可解析 -> 该候选失效(等第二遍/重估)
+            BigInteger v144 = resolveFluidValue144(fu.fluidName, stack);
+            if (v144 == null) {
+                return null; // 流体价值递归中/当前不可解析 -> 该候选失效(等第二遍/重估)
             }
-            if (v144 <= 0) {
+            if (!EmcMath.isPositive(v144)) {
                 if (!AutoEmcConfig.unpricedIsZero) {
-                    return UNKNOWN; // 不允许把无价流体当 0 用时,配方失效
+                    return null; // 不允许把无价流体当 0 用时,配方失效
                 }
                 continue; // 免费流体(水/蒸汽/未定价)不产生成本
             }
-            long term = (v144 * fu.amountL + 143) / 144; // 向上取整:144L = 1 锭
-            sum += term;
-            if (sum < 0) {
-                return UNKNOWN; // 溢出保护
-            }
+            // 向上取整:144L = 1 锭
+            sum = EmcMath.add(sum, EmcMath.ceilDiv(EmcMath.mul(v144, fu.amountL), 144L));
         }
         return sum;
     }
 
     /**
-     * 流体每 144L 的价值(UNKNOWN=-1 表示当前不可解析,不缓存;0 缓存=免费流体):
+     * 流体每 144L 的价值(null 表示当前不可解析,不缓存;0 缓存=免费流体):
      * <ol>
      * <li>EmcRegistry 注册值(其他 mod/用户经 Registry API 注册,语义=每 144L);</li>
      * <li>GT 材料流体:对应材料锭(回落热锭/粉/宝石)的物品价值 —— "144L = 1 锭";</li>
@@ -597,29 +608,30 @@ public final class EmcEngine {
      * 多条产者取每 144L 最便宜;</li>
      * <li>以上皆无 -> 地下流体兜底价 1 L(mB)=1 EMC,即每 144L = 144。</li>
      * </ol>
-     * 递归环(流体↔物品/流体↔流体)返回 UNKNOWN 不缓存,由 resolveDeferred / fluidRecompute
+     * 递归环(流体↔物品/流体↔流体)返回 null(未知)不缓存,由 resolveDeferred / fluidRecompute
      * 在基础定价后重估。
      */
-    private long resolveFluidValue144(String name, Deque<ItemKey> stack) {
-        Long memo = fluidMemo.get(name);
+    private BigInteger resolveFluidValue144(String name, Deque<ItemKey> stack) {
+        BigInteger memo = fluidMemo.get(name);
         if (memo != null) {
             return memo;
         }
         if (fluidStack.size() > 24) {
-            return UNKNOWN; // 递归过深防御
+            return null; // 递归过深防御
         }
         // 1) 注册表(其他 mod / 未来 Registry Types 流体价)
         // 流体注册名可含 ':'(EmcKey canonical 用 ':' 分隔 type:id,构造器拒收)-> 含 ':' 的
         // 名字跳过注册表查询,仍可走材料锚/配方反推(那两条链用原始名作 map 键,不经 EmcKey)。
-        long reg = 0;
+        // 注册表仍是 int 域(它镜像进 PE 的 int 类型表),这里只是读侧的边界转换:负数/0 都按无值
+        BigInteger reg = BigInteger.ZERO;
         if (name.indexOf(':') < 0) {
             int rv = EmcRegistry.instance()
                 .getFluidValue(name);
             if (rv > 0) {
-                reg = rv;
+                reg = BigInteger.valueOf(rv);
             }
         }
-        if (reg > 0) {
+        if (EmcMath.isPositive(reg)) {
             fluidMemo.put(name, reg);
             return reg;
         }
@@ -629,19 +641,19 @@ public final class EmcEngine {
             if (flu != null) {
                 ItemStack anchor = GtMachines.materialAnchorStack(flu);
                 if (anchor != null) {
-                    long av = eval(ItemKey.of(anchor), stack);
-                    if (av > 0) {
+                    BigInteger av = eval(ItemKey.of(anchor), stack);
+                    if (EmcMath.isPositive(av)) {
                         fluidMemo.put(name, av);
                         return av;
                     }
-                    if (av == UNKNOWN) {
-                        return UNKNOWN; // 锚在递归环上:不缓存,等基础定价后重估
+                    if (av == null) {
+                        return null; // 锚在递归环上:不缓存,等基础定价后重估
                     }
                     // 锚 = 0(材料本身无价)-> 落入反推/免费
                 }
             }
         } catch (Throwable t) {
-            return UNKNOWN; // GT API 异常:按当前不可解析处理,不缓存
+            return null; // GT API 异常:按当前不可解析处理,不缓存
         }
         // 3) 配方反推(无产者 -> 4) 地下流体兜底价 1mB(=GT 的 L)=1 EMC,即每 144L = 144)
         List<FluidProducer> list = fluidProducers.get(name);
@@ -650,80 +662,77 @@ public final class EmcEngine {
             return FLUID_UNDERGROUND_PER_144L;
         }
         if (fluidStack.contains(name)) {
-            return UNKNOWN; // 流体环
+            return null; // 流体环
         }
         fluidStack.addLast(name);
-        long best = Long.MAX_VALUE;
+        BigInteger best = null;
         try {
             for (FluidProducer p : list) {
-                long cost = fluidProducerCost(p, stack);
-                if (cost == UNKNOWN || cost < 0) {
+                BigInteger cost = fluidProducerCost(p, stack);
+                if (cost == null) {
                     continue;
                 }
-                long per144 = (cost * 144 + p.outputL - 1) / p.outputL; // 每 144L 折算,向上取整
-                if (per144 < best) {
+                // 每 144L 折算,向上取整
+                BigInteger per144 = EmcMath.ceilDiv(EmcMath.mul(cost, 144), p.outputL);
+                if (best == null || EmcMath.cmp(per144, best) < 0) {
                     best = per144;
                 }
             }
         } finally {
             fluidStack.removeLast();
         }
-        if (best == Long.MAX_VALUE) {
-            return UNKNOWN; // 产者全部不可解析:不缓存,重估时再试
+        if (best == null) {
+            return null; // 产者全部不可解析:不缓存,重估时再试
         }
         fluidMemo.put(name, best);
         return best;
     }
 
-    /** 单条流体产者配方总成本(物品输入按槽有价优先选价 + 流体输入递归);任一部分不可解析返回 UNKNOWN。 */
-    private long fluidProducerCost(FluidProducer p, Deque<ItemKey> stack) {
-        long sum = 0;
+    /** 单条流体产者配方总成本(物品输入按槽有价优先选价 + 流体输入递归);任一部分不可解析返回 null。 */
+    private BigInteger fluidProducerCost(FluidProducer p, Deque<ItemKey> stack) {
+        BigInteger sum = BigInteger.ZERO;
         for (EmcIngredient ing : p.inputs) {
-            long bestPriced = Long.MAX_VALUE;
+            BigInteger bestPriced = null;
             boolean any = false;
             boolean sawFree = false;
             for (ItemKey opt : ing.options) {
-                long v = eval(opt, stack);
-                if (v == UNKNOWN) {
+                BigInteger v = eval(opt, stack);
+                if (v == null) {
                     continue;
                 }
                 any = true;
-                if (v > 0 && v < bestPriced) {
-                    bestPriced = v;
-                } else if (v <= 0) {
+                if (EmcMath.isPositive(v)) {
+                    if (bestPriced == null || EmcMath.cmp(v, bestPriced) < 0) {
+                        bestPriced = v;
+                    }
+                } else {
                     sawFree = true;
                 }
             }
             if (!any) {
-                return UNKNOWN;
+                return null;
             }
-            long opt = bestPriced != Long.MAX_VALUE ? bestPriced : 0;
-            if (!sawFree && bestPriced == Long.MAX_VALUE) {
-                return UNKNOWN;
+            BigInteger opt = bestPriced != null ? bestPriced : BigInteger.ZERO;
+            if (!sawFree && bestPriced == null) {
+                return null;
             }
-            if (!AutoEmcConfig.unpricedIsZero && opt <= 0) {
-                return UNKNOWN;
+            if (!AutoEmcConfig.unpricedIsZero && !EmcMath.isPositive(opt)) {
+                return null;
             }
-            sum += opt * ing.qty;
-            if (sum < 0) {
-                return UNKNOWN;
-            }
+            sum = EmcMath.add(sum, EmcMath.mul(opt, ing.qty));
         }
         for (FluidUse fu : p.fluids) {
-            long v144 = resolveFluidValue144(fu.fluidName, stack);
-            if (v144 == UNKNOWN) {
-                return UNKNOWN;
+            BigInteger v144 = resolveFluidValue144(fu.fluidName, stack);
+            if (v144 == null) {
+                return null;
             }
-            if (v144 <= 0) {
+            if (!EmcMath.isPositive(v144)) {
                 if (!AutoEmcConfig.unpricedIsZero) {
-                    return UNKNOWN;
+                    return null;
                 }
                 continue;
             }
-            sum += (v144 * fu.amountL + 143) / 144;
-            if (sum < 0) {
-                return UNKNOWN;
-            }
+            sum = EmcMath.add(sum, EmcMath.ceilDiv(EmcMath.mul(v144, fu.amountL), 144L));
         }
         return sum;
     }
@@ -754,7 +763,7 @@ public final class EmcEngine {
             if (knownValue(key) != null || isAnchoredByPe(key)) {
                 continue;
             }
-            if (evalTarget(key) > 0) {
+            if (EmcMath.isPositive(evalTarget(key))) {
                 computed++;
             }
         }
@@ -762,7 +771,7 @@ public final class EmcEngine {
     }
 
     /** (类别, 等级, 组装机系, 输入形态等级, 流体量, 单位成本) 字典序;后四者只用于同类别同等级之间比较 */
-    private boolean better(EmcRecipe r, long unitCost, EmcRecipe best, long bestUnitCost) {
+    private boolean better(EmcRecipe r, BigInteger unitCost, EmcRecipe best, BigInteger bestUnitCost) {
         if (r.category != best.category) {
             return r.category < best.category;
         }
@@ -781,7 +790,7 @@ public final class EmcEngine {
         if (r.fluidAmount != best.fluidAmount) {
             return r.fluidAmount < best.fluidAmount; // 流体越少越优先(合成路径液体少)
         }
-        return unitCost < bestUnitCost;
+        return EmcMath.cmp(unitCost, bestUnitCost) < 0;
     }
 
     /**
@@ -790,11 +799,11 @@ public final class EmcEngine {
      * 必须每次启动重注册,否则重启后(PE 值不持久、靠 AutoEMC 每次重注册)树/EMC 里它们价格缺失
      * 或归零(假电路板正是这种:无产出配方,不在 producers 里,上次平均的板子靠本次扫尾注册)。
      */
-    public Map<ItemKey, Integer> collectFinalValues() {
-        Map<ItemKey, Integer> result = new HashMap<>();
+    public Map<ItemKey, BigInteger> collectFinalValues() {
+        Map<ItemKey, BigInteger> result = new HashMap<>();
         for (ItemKey key : known.keySet()) {
-            Integer v = known.get(key);
-            if (v == null || v <= 0) {
+            BigInteger v = known.get(key);
+            if (!EmcMath.isPositive(v)) {
                 continue;
             }
             if (peHas(key)) {
@@ -833,8 +842,8 @@ public final class EmcEngine {
                     if (known.containsKey(key) || peHas(key)) {
                         continue;
                     }
-                    int v = eval(key, new ArrayDeque<>());
-                    if (v > 0) {
+                    BigInteger v = eval(key, new ArrayDeque<>());
+                    if (EmcMath.isPositive(v)) {
                         priced++;
                     }
                 }
@@ -866,29 +875,30 @@ public final class EmcEngine {
                 if (members.isEmpty()) {
                     continue;
                 }
-                long sum = 0;
+                BigInteger sum = BigInteger.ZERO;
                 int count = 0;
                 for (ItemStack ms : members) {
-                    int v = currentValue(ItemKey.of(ms));
-                    if (v > 0) {
-                        sum += v;
+                    BigInteger v = currentValue(ItemKey.of(ms));
+                    if (EmcMath.isPositive(v)) {
+                        sum = EmcMath.add(sum, v);
                         count++;
                     }
                 }
                 if (count <= 0) {
                     continue;
                 }
-                int mean = (int) Math.min(Integer.MAX_VALUE - 1, Math.max(1, sum / count));
+                // 同级均值(至少 1);BigInteger 版不再夹到 int 上限
+                BigInteger mean = EmcMath.max(EmcMath.div(sum, count), BigInteger.ONE);
                 for (ItemStack ms : members) {
                     ItemKey mk = ItemKey.of(ms);
                     if (peHas(mk)) {
                         continue; // 锚点不覆盖
                     }
-                    Integer old = known.get(mk);
+                    BigInteger old = known.get(mk);
                     known.put(mk, mean);
                     chosen.remove(mk);
                     pickedOptions.remove(mk);
-                    if (old == null || old != mean) {
+                    if (old == null || !old.equals(mean)) {
                         changed++;
                     }
                     circuitAveraged.add(mk);
@@ -919,7 +929,7 @@ public final class EmcEngine {
             if (knownValue(key) != null || isAnchoredByPe(key)) {
                 continue;
             }
-            if (evalTarget(key) > 0) {
+            if (EmcMath.isPositive(evalTarget(key))) {
                 computed++;
             }
         }
@@ -936,12 +946,12 @@ public final class EmcEngine {
         return circuitAveraged.contains(key);
     }
 
-    private int currentValue(ItemKey key) {
-        Integer v = known.get(key);
+    private BigInteger currentValue(ItemKey key) {
+        BigInteger v = known.get(key);
         if (v != null) {
             return v;
         }
-        return peHas(key) ? peValue(key) : 0;
+        return peHas(key) ? peValue(key) : BigInteger.ZERO;
     }
 
     /** 每个物品选中的配方快照(命令展示用) */
@@ -983,20 +993,21 @@ public final class EmcEngine {
             java.util.Iterator<String> fit = fluidMemo.keySet()
                 .iterator();
             while (fit.hasNext()) {
-                if (fluidMemo.get(fit.next()) <= 0) {
+                BigInteger fv = fluidMemo.get(fit.next());
+                if (!EmcMath.isPositive(fv)) {
                     fit.remove();
                 }
             }
             for (ItemKey key : new ArrayList<>(producers.keySet())) {
-                Integer v = known.get(key);
-                if (v == null || v > 0) {
+                BigInteger v = known.get(key);
+                if (v == null || EmcMath.isPositive(v)) {
                     continue;
                 }
                 known.remove(key);
                 chosen.remove(key);
                 pickedOptions.remove(key);
-                int nv = eval(key, new ArrayDeque<>());
-                if (nv > 0) {
+                BigInteger nv = eval(key, new ArrayDeque<>());
+                if (EmcMath.isPositive(nv)) {
                     resolved++;
                     changed = true;
                 }

@@ -5,6 +5,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -13,9 +14,12 @@ import java.util.List;
 import java.util.Map;
 
 import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+
+import com.gtnh.autoemc.compat.ProjectExpansionCompat;
 
 import moze_intel.projecte.api.ProjectEAPI;
 import moze_intel.projecte.api.proxy.IEMCProxy;
@@ -56,11 +60,11 @@ public final class EmcRunner {
     /** compute + apply 的中间产物(同步路径直接传递;专用服务器路径由后台线程发布、tick 消费) */
     private static final class PendingResult {
 
-        final Map<ItemKey, Integer> finalValues;
+        final Map<ItemKey, BigInteger> finalValues;
         final Map<ItemKey, List<Pick>> mergedChains;
         final EmcEngine engine;
 
-        PendingResult(Map<ItemKey, Integer> finalValues, Map<ItemKey, List<Pick>> mergedChains, EmcEngine engine) {
+        PendingResult(Map<ItemKey, BigInteger> finalValues, Map<ItemKey, List<Pick>> mergedChains, EmcEngine engine) {
             this.finalValues = finalValues;
             this.mergedChains = mergedChains;
             this.engine = engine;
@@ -211,7 +215,7 @@ public final class EmcRunner {
         File cacheFile = AutoEmcConfig.getCacheFile();
         boolean cacheOk = AutoEmcConfig.cacheJson && !AutoEmcConfig.forceRebuild
             && fingerprint.equals(ValueStore.readFingerprint(cacheFile));
-        Map<ItemKey, Integer> cached = cacheOk ? ValueStore.load(cacheFile) : new HashMap<>();
+        Map<ItemKey, BigInteger> cached = cacheOk ? ValueStore.load(cacheFile) : new HashMap<>();
         // 对齐链与指纹无关地累积读取:AutoEMC 定价物品的值进 PE/缓存后不再重算,
         // 链要从持久文件恢复,才能保证 /projecte_autoemc view 在任意一次启动都回放完整配方树。
         Map<ItemKey, List<Pick>> persistedChains = AutoEmcConfig.cacheJson ? ValueStore.loadChains(cacheFile)
@@ -243,7 +247,7 @@ public final class EmcRunner {
 
         // GTMoreEMC 移植:GT 材料形态直接按 质量×72×形态系数 定价(命中即定,不再走配方图;
         // 不覆盖 PE 锚点)。注入到 known 里,优先于一切配方求值。
-        Map<ItemKey, Integer> seeds = new HashMap<>();
+        Map<ItemKey, BigInteger> seeds = new HashMap<>();
         if (GtMachines.available()) {
             seeds.putAll(GtMachines.collectMaterialSeeds());
             seeds.putAll(GtMachines.collectFixedSeeds());
@@ -267,7 +271,7 @@ public final class EmcRunner {
             if (engine.knownValue(key) != null || engine.isAnchoredByPe(key)) {
                 continue;
             }
-            if (engine.evalTarget(key) > 0) {
+            if (EmcMath.isPositive(engine.evalTarget(key))) {
                 computed++;
             } else {
                 zeroValued++;
@@ -325,7 +329,7 @@ public final class EmcRunner {
                 dustMirrored);
         }
 
-        Map<ItemKey, Integer> finalValues = engine.collectFinalValues();
+        Map<ItemKey, BigInteger> finalValues = engine.collectFinalValues();
         int newCount = 0;
         for (ItemKey key : finalValues.keySet()) {
             if (!engine.isPreloaded(key)) {
@@ -399,13 +403,40 @@ public final class EmcRunner {
             // 直调 APICustomEMCMapper.instance(public,无 loader-state 门禁):值写入内存表,
             // 由下方 map#2 的 addMappings 消费(activeModContainer 为 null -> "unknown mod",
             // 走 modlessCustomEMCPriority,默认 1,0 禁用)。
-            for (Map.Entry<ItemKey, Integer> e : r.finalValues.entrySet()) {
-                APICustomEMCMapper.instance.registerCustomEMC(
-                    e.getKey()
-                        .toStack(),
-                    e.getValue());
+            int viaPx = 0;
+            int capped = 0;
+            int withMeta = 0;
+            for (Map.Entry<ItemKey, BigInteger> e : r.finalValues.entrySet()) {
+                ItemStack stack = e.getKey()
+                    .toStack();
+                BigInteger value = e.getValue();
+                // 价格上限:引擎内部不再夹取,但写回边界要夹 —— 超过 1e60 的"价格"没有实际意义,
+                // 却会让独立玩家(非团队模式,余额是 double)卖一件东西就把 EMC 顶到 Double.MAX_VALUE
+                BigInteger cappedValue = EmcMath.capPrice(value);
+                if (cappedValue != value) {
+                    capped++;
+                }
+                if (stack.getItemDamage() != 0) {
+                    withMeta++;
+                }
+                // 装了 PE-E-GTNH:把精确 BigInteger 交给它的精确表(按物品栈注册,含元数据;
+                // 它会镜像进 ProjectE 的 int 表),转化桌/冷凝器/机器就能按精确值记账;
+                // 没装则先在写回边界夹到 ProjectE 的 int 上界再写,游戏内可观察行为与改造前一致
+                if (ProjectExpansionCompat.register(stack, cappedValue)) {
+                    viaPx++;
+                } else {
+                    APICustomEMCMapper.instance.registerCustomEMC(
+                        stack,
+                        EmcMath.clampToPeInt(cappedValue)
+                            .intValue());
+                }
             }
-            LOG.info("Registered {} custom EMC values.", r.finalValues.size());
+            LOG.info(
+                "Registered {} custom EMC values ({} via ProjectE-Expansion-GTNH exact table, {} with metadata, {} capped at 1e60).",
+                r.finalValues.size(),
+                viaPx,
+                withMeta,
+                capped);
 
             // 复刻 /projecte reloadEMC:重建映射并推送给已连接玩家
             long t1 = System.currentTimeMillis();
@@ -457,7 +488,7 @@ public final class EmcRunner {
         return removed;
     }
 
-    private static void writeCsv(File file, Map<ItemKey, Integer> values, EmcEngine engine) {
+    private static void writeCsv(File file, Map<ItemKey, BigInteger> values, EmcEngine engine) {
         try (BufferedWriter w = new BufferedWriter(
             new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
             w.write("item,damage,value,category,tier,recipe\n");
@@ -479,20 +510,16 @@ public final class EmcRunner {
                     cat = "circuitAvg";
                     src = "tier-average";
                 }
-                w.write(
-                    Item.itemRegistry.getNameForObject(key.item) + "@"
-                        + key.damage
-                        + ","
-                        + key.damage
-                        + ","
-                        + values.get(key)
-                        + ","
-                        + cat
-                        + ","
-                        + tier
-                        + ","
-                        + src
-                        + "\n");
+                w.write(Item.itemRegistry.getNameForObject(key.item) + "@" + key.damage + "," + key.damage + ","
+                // 十进制文本(无千分位分隔符),供表格/脚本直接读取
+                    + EmcMath.text(values.get(key))
+                    + ","
+                    + cat
+                    + ","
+                    + tier
+                    + ","
+                    + src
+                    + "\n");
             }
         } catch (IOException e) {
             LOG.error("Failed to write CSV dump", e);

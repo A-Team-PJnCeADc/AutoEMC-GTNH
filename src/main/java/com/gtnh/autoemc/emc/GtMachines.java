@@ -1,6 +1,7 @@
 package com.gtnh.autoemc.emc;
 
 import java.lang.reflect.Field;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
@@ -102,23 +103,23 @@ public final class GtMachines {
      * 同 oredict 其他"有价"成员的平均价 —— 规则"任意电路板的价格 = 同等级电路板总价 / 数量"
      * (只对无价成员生效;有价成员是基准,不被改动;有价基准数量不足时返回 0 由调用方决定不缓存)。
      *
-     * @return &gt;0 平均价;0 = 非电路板 / 一次性工具(编程电路等)/ 同级无任何有价成员
+     * @return 平均价(BigInteger);null = 非电路板 / 一次性工具(编程电路等)/ 同级无任何有价成员
      */
-    public static int circuitBoardAverage(ItemKey key, EmcEngine engine, Deque<ItemKey> stack) {
+    public static BigInteger circuitBoardAverage(ItemKey key, EmcEngine engine, Deque<ItemKey> stack) {
         if (!available() || key == null || engine == null) {
-            return 0;
+            return null;
         }
         try {
             ItemStack self = key.toStack();
             if (isOneTimeItem(self)) {
-                return 0; // 编程电路等一次性工具不套平均价规则
+                return null; // 编程电路等一次性工具不套平均价规则
             }
             for (int oreId : OreDictionary.getOreIDs(self)) {
                 String oreName = OreDictionary.getOreName(oreId);
                 if (oreName == null || !oreName.startsWith("circuit")) {
                     continue;
                 }
-                long sum = 0;
+                BigInteger sum = BigInteger.ZERO;
                 int count = 0;
                 for (ItemStack member : new ArrayList<>(OreDictionary.getOres(oreName))) {
                     if (member == null || member.getItem() == null
@@ -129,20 +130,21 @@ public final class GtMachines {
                     if (mk.equals(key)) {
                         continue; // 自己不算进平均(只对"其他"有价成员取均值)
                     }
-                    int v = engine.evalFraction(mk, stack);
-                    if (v > 0) {
-                        sum += v;
+                    BigInteger v = engine.evalFraction(mk, stack);
+                    if (EmcMath.isPositive(v)) {
+                        sum = EmcMath.add(sum, v);
                         count++;
                     }
                 }
                 if (count > 0) {
-                    return (int) Math.min(Integer.MAX_VALUE - 1, Math.max(1, sum / count));
+                    // 同级均值(至少 1);BigInteger 版不再夹到 int 上限
+                    return EmcMath.max(EmcMath.div(sum, count), BigInteger.ONE);
                 }
             }
         } catch (Throwable t) {
             // 求值失败按不可平均处理
         }
-        return 0;
+        return null;
     }
 
     /**
@@ -150,16 +152,16 @@ public final class GtMachines {
      * 粉/锭存在固定份量比(如 dustTiny = dust/9、dustSmall = dust/4、nugget = ingot/9)。
      * 无配方物品求值时若可折算到同材料基准份,则按份量比计价 —— 否则能量水晶这类
      * "粉->小撮粉->…"的链会在小撮粉处断掉。
-     * 返回 0 = 不可折算(非 GT 材料/无基准份/基准份无价)。
+     * 返回 null = 不可折算(非 GT 材料/无基准份/基准份尚无价)。
      */
-    public static int materialFractionValue(ItemKey key, EmcEngine engine, Deque<ItemKey> stack) {
+    public static BigInteger materialFractionValue(ItemKey key, EmcEngine engine, Deque<ItemKey> stack) {
         if (!available() || key == null || engine == null) {
-            return 0;
+            return null;
         }
         try {
             ItemData d = GTOreDictUnificator.getAssociation(key.toStack());
             if (d == null || d.mPrefix == null || d.mMaterial == null || d.mMaterial.mMaterial == null) {
-                return 0;
+                return null;
             }
             OrePrefixes base;
             if (d.mPrefix == OrePrefixes.dustTiny || d.mPrefix == OrePrefixes.dustSmall) {
@@ -171,27 +173,27 @@ public final class GtMachines {
             } else if (d.mPrefix == OrePrefixes.bolt || d.mPrefix == OrePrefixes.screw) {
                 base = OrePrefixes.stick; // 螺栓/螺丝 = 杆/2
             } else {
-                return 0;
+                return null;
             }
             if (d.mPrefix.mMaterialAmount <= 0 || base.mMaterialAmount <= 0) {
-                return 0;
+                return null;
             }
             ItemStack baseStack = GTOreDictUnificator.get(base, d.mMaterial.mMaterial, 1);
             if (baseStack == null || baseStack.getItem() == null) {
-                return 0;
+                return null;
             }
             ItemKey baseKey = ItemKey.of(baseStack);
             if (baseKey.equals(key)) {
-                return 0;
+                return null;
             }
-            int baseVal = engine.evalFraction(baseKey, stack);
-            if (baseVal <= 0) {
-                return 0;
+            BigInteger baseVal = engine.evalFraction(baseKey, stack);
+            if (!EmcMath.isPositive(baseVal)) {
+                return null;
             }
-            long v = (long) baseVal * d.mPrefix.mMaterialAmount / base.mMaterialAmount;
-            return (int) Math.min(Integer.MAX_VALUE - 1, Math.max(0, v));
+            // 份量比 = 本形态材料量 / 基准份材料量(整数除法向下取整,与原 int 版一致)
+            return EmcMath.div(EmcMath.mul(baseVal, d.mPrefix.mMaterialAmount), base.mMaterialAmount);
         } catch (Throwable t) {
-            return 0;
+            return null;
         }
     }
 
@@ -478,7 +480,7 @@ public final class GtMachines {
         }
     }
 
-    /** mEUt -> 电压等级索引(0=ULV,1=LV,...);超出上限返回最后一个索引+1 */
+    /** mEUt -> 电压等级索引(0=ULV,1=LV,…);超出上限返回最后一个索引+1 */
     private static int voltageRankOf(int eut) {
         ensureTierCaps();
         for (int i = 0; i < recipeEUtCaps.length; i++) {
@@ -1012,8 +1014,8 @@ public final class GtMachines {
      * 为准,GTOreDictUnificator.get 为 null 即跳过,等价于 GTMoreEMC 按 property/flag 门控)。
      * 只在 GT 加载时可用;异常整体放弃并记日志(不让种子阶段搞崩求值)。
      */
-    public static Map<ItemKey, Integer> collectMaterialSeeds() {
-        Map<ItemKey, Integer> seeds = new HashMap<>();
+    public static Map<ItemKey, BigInteger> collectMaterialSeeds() {
+        Map<ItemKey, BigInteger> seeds = new HashMap<>();
         if (!available()) {
             return seeds;
         }
@@ -1043,11 +1045,12 @@ public final class GtMachines {
                         || stack.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
                         continue;
                     }
-                    long v = base * f.num / f.den;
-                    if (v <= 0) {
+                    // 质量价 × 形态系数(num/den);BigInteger 版不再夹到 int 上限
+                    BigInteger v = EmcMath.div(EmcMath.mul(BigInteger.valueOf(base), f.num), f.den);
+                    if (!EmcMath.isPositive(v)) {
                         continue;
                     }
-                    seeds.put(ItemKey.of(stack), (int) Math.min(Integer.MAX_VALUE - 1, v));
+                    seeds.put(ItemKey.of(stack), v);
                 }
             }
         } catch (Throwable t) {
@@ -1057,14 +1060,14 @@ public final class GtMachines {
         return seeds;
     }
 
-    private static void putIfValid(Map<ItemKey, Integer> seeds, ItemStack stack, long value) {
+    private static void putIfValid(Map<ItemKey, BigInteger> seeds, ItemStack stack, long value) {
         if (stack == null || stack.getItem() == null || stack.getItemDamage() == OreDictionary.WILDCARD_VALUE) {
             return;
         }
         if (value <= 0) {
             return;
         }
-        seeds.put(ItemKey.of(stack), (int) Math.min(Integer.MAX_VALUE - 1, value));
+        seeds.put(ItemKey.of(stack), BigInteger.valueOf(value));
     }
 
     /**
@@ -1073,8 +1076,8 @@ public final class GtMachines {
      * GTMoreEMC 里 GTCEu 专属、GT5.09 无对应物的条目(木模空/砖=8、压缩焦炉黏土=16、
      * 焦炉砖=16、焦炉砖外壳=64、原始砖外壳=8424)不在此列 —— GTNH 无这些物品,直接跳过。
      */
-    public static Map<ItemKey, Integer> collectFixedSeeds() {
-        Map<ItemKey, Integer> seeds = new HashMap<>();
+    public static Map<ItemKey, BigInteger> collectFixedSeeds() {
+        Map<ItemKey, BigInteger> seeds = new HashMap<>();
         try {
             putIfValid(seeds, new ItemStack(Items.paper), 32L);
         } catch (Throwable t) {

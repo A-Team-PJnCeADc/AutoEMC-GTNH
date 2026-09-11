@@ -1,5 +1,6 @@
 package com.gtnh.autoemc.emc;
 
+import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -20,7 +21,7 @@ public final class EmcRuntime {
     /** 单条对齐链的最大节点数(防止组装消息过大) */
     public static final int MAX_CHAIN_NODES = 3000;
 
-    private static volatile Map<ItemKey, Integer> lastValues = new HashMap<>();
+    private static volatile Map<ItemKey, BigInteger> lastValues = new HashMap<>();
     private static volatile Map<ItemKey, EmcRecipe> lastChosen = new HashMap<>();
     private static volatile Map<ItemKey, List<Pick>> lastPicks = new HashMap<>();
     /** 本次运行按同级平均定价的假电路板(describe 的来源标注用) */
@@ -47,7 +48,7 @@ public final class EmcRuntime {
 
     private EmcRuntime() {}
 
-    public static void capture(Map<ItemKey, Integer> values, Map<ItemKey, EmcRecipe> chosen,
+    public static void capture(Map<ItemKey, BigInteger> values, Map<ItemKey, EmcRecipe> chosen,
         Map<ItemKey, List<Pick>> picks, Set<ItemKey> averaged) {
         lastValues = new HashMap<>(values);
         lastChosen = new HashMap<>(chosen);
@@ -61,11 +62,17 @@ public final class EmcRuntime {
 
     /** 返回形如 "EMC=800, 来源=工作台/crafting";无记录返回 null */
     public static String describe(ItemKey key) {
-        Integer v = lastValues.get(key);
+        BigInteger v = lastValues.get(key);
         if (v == null) {
             return null;
         }
-        StringBuilder sb = new StringBuilder("EMC=").append(v);
+        // 展示用十进制文本;超过写回上限(PRICE_CAP,1e60)的值在游戏里只会按上限注册,
+        // 这里同步夹取并标注,避免命令行显示的值和实际注册值不一致造成误判
+        BigInteger shown = EmcMath.capPrice(v);
+        StringBuilder sb = new StringBuilder("EMC=").append(shown.toString());
+        if (shown != v) {
+            sb.append(" (已按 1e60 上限注册)");
+        }
         EmcRecipe r = lastChosen.get(key);
         if (r != null) {
             sb.append(", 来源=")
