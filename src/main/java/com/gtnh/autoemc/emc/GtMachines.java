@@ -148,26 +148,31 @@ public final class GtMachines {
     }
 
     /**
-     * GT 材料"份量"折算:小撮粉/小堆粉/粒 等没有产出配方(主要靠副产),但它们与同材料的
-     * 粉/锭存在固定份量比(如 dustTiny = dust/9、dustSmall = dust/4、nugget = ingot/9)。
-     * 无配方物品求值时若可折算到同材料基准份,则按份量比计价 —— 否则能量水晶这类
-     * "粉->小撮粉->…"的链会在小撮粉处断掉。
-     * 返回 null = 不可折算(非 GT 材料/无基准份/基准份尚无价)。
+     * 该形态的份量基准物品键(小撮/小堆粉->粉、粒->锭、螺栓/螺丝->杆);非份量形态或
+     * 基准物品不存在时返回 null。粉->锭 的映射只在"粉自己没有产出配方"时兜底用。
+     *
+     * 用途:让 eval() 区分两件完全不同的事 ——
+     * (1) 没有份量规则(null):物品确实无从定价,按 0(免费)处理;
+     * (2) 有基准但基准尚未定价(null):返回"未知"、不缓存,等 resolveDeferred 重估。
+     * 混为一谈会把"环上待定"当成 0 价,让吃它的配方以 0 成本胜出。
      */
-    public static BigInteger materialFractionValue(ItemKey key, EmcEngine engine, Deque<ItemKey> stack) {
-        if (!available() || key == null || engine == null) {
+    public static ItemKey fractionBaseKey(ItemKey key) {
+        if (!available() || key == null || key.item == null) {
             return null;
         }
         try {
             ItemData d = GTOreDictUnificator.getAssociation(key.toStack());
-            if (d == null || d.mPrefix == null || d.mMaterial == null || d.mMaterial.mMaterial == null) {
+            if (d == null || d.mPrefix == null
+                || d.mMaterial == null
+                || d.mMaterial.mMaterial == null
+                || d.mPrefix.mMaterialAmount <= 0) {
                 return null;
             }
             OrePrefixes base;
             if (d.mPrefix == OrePrefixes.dustTiny || d.mPrefix == OrePrefixes.dustSmall) {
                 base = OrePrefixes.dust;
             } else if (d.mPrefix == OrePrefixes.dust) {
-                base = OrePrefixes.ingot; // 最大的粉 = 锭
+                base = OrePrefixes.ingot; // 兜底:粉没有自己的配方时 = 锭
             } else if (d.mPrefix == OrePrefixes.nugget) {
                 base = OrePrefixes.ingot;
             } else if (d.mPrefix == OrePrefixes.bolt || d.mPrefix == OrePrefixes.screw) {
@@ -175,7 +180,7 @@ public final class GtMachines {
             } else {
                 return null;
             }
-            if (d.mPrefix.mMaterialAmount <= 0 || base.mMaterialAmount <= 0) {
+            if (base.mMaterialAmount <= 0) {
                 return null;
             }
             ItemStack baseStack = GTOreDictUnificator.get(base, d.mMaterial.mMaterial, 1);
@@ -183,7 +188,153 @@ public final class GtMachines {
                 return null;
             }
             ItemKey baseKey = ItemKey.of(baseStack);
-            if (baseKey.equals(key)) {
+            return baseKey.equals(key) ? null : baseKey;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 该形态的 GT 材料量(锭=1、粉=1、小堆粉=1/4、小撮粉=1/9、粒=1/9…);非 GT 材料返回 0。 */
+    public static long materialAmount(ItemKey key) {
+        if (!available() || key == null || key.item == null) {
+            return 0L;
+        }
+        try {
+            ItemData d = GTOreDictUnificator.getAssociation(key.toStack());
+            return d == null || d.mPrefix == null ? 0L : d.mPrefix.mMaterialAmount;
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 是否是同一材料的"等价形态":锭/热锭/粉/小堆粉/小撮粉/粒/杆/螺栓/螺丝。
+     * 这些形态之间只差 GT 材料量(ingot=ingotHot=dust=M、dustSmall=M/4、dustTiny=nugget=M/9、
+     * stick=M/2、bolt=screw=M/8),按"材料等价"处理:一个材料只保留一个单价,
+     * 其余形态按材料量比换算,不再展开各自的配方(见 EmcEngine.materializeMaterialFamilies)。
+     */
+    public static boolean isMaterialForm(ItemKey key) {
+        if (!available() || key == null || key.item == null) {
+            return false;
+        }
+        try {
+            ItemData d = GTOreDictUnificator.getAssociation(key.toStack());
+            if (d == null || d.mPrefix == null || d.mPrefix.mMaterialAmount <= 0) {
+                return false;
+            }
+            return isMaterialFormPrefix(d.mPrefix);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean isMaterialFormPrefix(OrePrefixes p) {
+        return p == OrePrefixes.ingot || p == OrePrefixes.ingotHot
+            || p == OrePrefixes.dust
+            || p == OrePrefixes.dustSmall
+            || p == OrePrefixes.dustTiny
+            || p == OrePrefixes.nugget
+            || p == OrePrefixes.stick
+            || p == OrePrefixes.bolt
+            || p == OrePrefixes.screw;
+    }
+
+    /**
+     * 两个物品是否同一 GT 材料的形态(用于判断配方是否"只吃本材料的形态",
+     * 即 锭↔粉↔热锭↔小堆粉 这类同材料自推的恒等式边)。非 GT 材料返回 false。
+     */
+    public static boolean sameMaterial(ItemKey a, ItemKey b) {
+        if (!available() || a == null || b == null || a.item == null || b.item == null) {
+            return false;
+        }
+        if (a.equals(b)) {
+            return true;
+        }
+        try {
+            ItemData da = GTOreDictUnificator.getAssociation(a.toStack());
+            ItemData db = GTOreDictUnificator.getAssociation(b.toStack());
+            if (da == null || db == null || da.mMaterial == null || db.mMaterial == null) {
+                return false;
+            }
+            return da.mMaterial.mMaterial != null && da.mMaterial.mMaterial == db.mMaterial.mMaterial;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 材料身份(GT Materials 对象):等价形态族的分组键;非 GT 材料返回 null。 */
+    public static Object materialIdentity(ItemKey key) {
+        if (!available() || key == null || key.item == null) {
+            return null;
+        }
+        try {
+            ItemData d = GTOreDictUnificator.getAssociation(key.toStack());
+            return d == null || d.mMaterial == null ? null : d.mMaterial.mMaterial;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 取"材料 + 形态前缀"的物品键(等价形态族收尾时按材料补齐各形态用);不存在返回 null。 */
+    public static ItemKey formKeyOf(Object material, OrePrefixes prefix) {
+        if (!available() || material == null || prefix == null) {
+            return null;
+        }
+        try {
+            ItemStack stack = GTOreDictUnificator.get(prefix, material, 1);
+            if (stack == null || stack.getItem() == null) {
+                return null;
+            }
+            return ItemKey.of(stack);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 等价形态族的所有前缀(收尾时遍历用)。 */
+    public static OrePrefixes[] materialFormPrefixes() {
+        return MATERIAL_FORM_PREFIXES;
+    }
+
+    private static final OrePrefixes[] MATERIAL_FORM_PREFIXES = new OrePrefixes[] { OrePrefixes.ingot,
+        OrePrefixes.ingotHot, OrePrefixes.dust, OrePrefixes.dustSmall, OrePrefixes.dustTiny, OrePrefixes.nugget,
+        OrePrefixes.stick, OrePrefixes.bolt, OrePrefixes.screw };
+
+    /** 该材料的全部等价形态物品键(锭/热锭/粉/小堆粉/小撮粉/粒/杆/螺栓/螺丝);GT 里不存在的形态跳过。 */
+    public static List<ItemKey> materialFormKeys(Object material) {
+        List<ItemKey> out = new ArrayList<>(MATERIAL_FORM_PREFIXES.length);
+        if (!available() || material == null) {
+            return out;
+        }
+        for (OrePrefixes p : MATERIAL_FORM_PREFIXES) {
+            ItemKey k = formKeyOf(material, p);
+            if (k != null) {
+                out.add(k);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * GT 材料"份量"折算:小撮粉/小堆粉/粒/螺栓/螺丝 等没有产出配方(主要靠副产),但它们与
+     * 同材料基准形态(粉/锭/杆)存在固定份量比(如 dustSmall = dust/4、dustTiny = dust/9、
+     * nugget = ingot/9)。无配方物品求值时若可折算到基准份,则按份量比计价。
+     *
+     * 返回 null = 不可折算:非 GT 材料 / 无基准份(结构性) **或** 基准份当前尚无价
+     * (环上/顺序依赖)。调用方负责区分这两种情况(见 fractionBaseKey 的说明)。
+     */
+    public static BigInteger materialFractionValue(ItemKey key, EmcEngine engine, Deque<ItemKey> stack) {
+        if (!available() || key == null || engine == null) {
+            return null;
+        }
+        try {
+            ItemKey baseKey = fractionBaseKey(key);
+            if (baseKey == null) {
+                return null;
+            }
+            long myAmount = materialAmount(key);
+            long baseAmount = materialAmount(baseKey);
+            if (myAmount <= 0 || baseAmount <= 0) {
                 return null;
             }
             BigInteger baseVal = engine.evalFraction(baseKey, stack);
@@ -191,15 +342,19 @@ public final class GtMachines {
                 return null;
             }
             // 份量比 = 本形态材料量 / 基准份材料量(整数除法向下取整,与原 int 版一致)
-            return EmcMath.div(EmcMath.mul(baseVal, d.mPrefix.mMaterialAmount), base.mMaterialAmount);
+            return EmcMath.div(EmcMath.mul(baseVal, myAmount), baseAmount);
         } catch (Throwable t) {
             return null;
         }
     }
 
     /**
-     * 份量形态:这些前缀直接按材料份量折算(最大的粉=锭、螺栓/螺丝=杆/2、小撮/小堆粉=粉/9…),
+     * 份量形态:这些前缀直接按材料份量折算(螺栓/螺丝=杆/2、小撮/小堆粉=粉/9、粒=锭/9…),
      * 求值时不再展开其机器/工作台配方,直接走 materialFractionValue + known 缓存复用。
+     *
+     * 注意:满粉(dust)**不**在这里 —— 粉是材料体系的基础形态、有大量自己的产出配方
+     * (化学反应釜、粉碎机…),必须参与配方比价;把小堆/小撮粉折算到"粉"的价即可。
+     * 粉只有在完全没有产出配方时,才由 eval() 的兜底分支折算到锭价。
      */
     public static boolean isFractionForm(ItemKey key) {
         if (!available() || key == null) {
@@ -211,8 +366,7 @@ public final class GtMachines {
                 return false;
             }
             OrePrefixes p = d.mPrefix;
-            return p == OrePrefixes.dust || p == OrePrefixes.dustTiny
-                || p == OrePrefixes.dustSmall
+            return p == OrePrefixes.dustTiny || p == OrePrefixes.dustSmall
                 || p == OrePrefixes.nugget
                 || p == OrePrefixes.bolt
                 || p == OrePrefixes.screw;

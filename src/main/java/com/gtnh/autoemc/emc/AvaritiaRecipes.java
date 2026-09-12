@@ -49,6 +49,28 @@ public final class AvaritiaRecipes {
         return cpw.mods.fml.common.Loader.isModLoaded("Avaritia");
     }
 
+    /**
+     * 是否"无尽类物品":注册命名空间是 Avaritia / avaritiaddons(无尽贪婪本体与附属)。
+     * 这类物品只要存在大工作台(Extreme Crafting Table)配方就优先走它,而不是
+     * 中子素压缩机/普通合成台等路径 —— 见 EmcEngine.eval 的选择链。
+     */
+    public static boolean isAvaritiaItem(ItemKey key) {
+        if (key == null || key.item == null) {
+            return false;
+        }
+        try {
+            Object name = net.minecraft.item.Item.itemRegistry.getNameForObject(key.item);
+            if (name == null) {
+                return false;
+            }
+            String s = name.toString()
+                .toLowerCase(java.util.Locale.ROOT);
+            return s.startsWith("avaritia") || s.startsWith("avaritiaddons");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** 遍历大工作台配方注册表,登记成生产者。单配方异常由 RecipeScan 隔离。 */
     public static void collect(Map<ItemKey, List<EmcRecipe>> producers, EmcStats stats) {
         if (!available()) {

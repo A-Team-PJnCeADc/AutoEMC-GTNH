@@ -329,6 +329,24 @@ public final class EmcRunner {
                 dustMirrored);
         }
 
+        // 材料等价形态族收尾(锭/热锭/粉/小堆粉/小撮粉/粒/杆/螺栓/螺丝):族内只留最便宜的
+        // 独立产线单价,其余形态 = 单价 × GT 材料量比,不再互推配方(顺序无关,消除任意定点)。
+        int familyWritten = engine.materializeMaterialFamilies();
+        if (familyWritten > 0) {
+            LOG.info(
+                "Materialized {} material-form family values (ingot/dust/small dust/nugget/stick/bolt/screw).",
+                familyWritten);
+        }
+
+        // 派生值收尾(份量折算形态、无配方粉兜底):按**最终**基准价统一落表。必须放在
+        // 所有补偿/镜像之后、collectFinalValues() 之前,否则会把中途基数的旧派生值写进结果。
+        int derivedWritten = engine.materializeDerived();
+        if (derivedWritten > 0) {
+            LOG.info(
+                "Materialized {} derived values (fraction forms / dust fallbacks) after all passes.",
+                derivedWritten);
+        }
+
         Map<ItemKey, BigInteger> finalValues = engine.collectFinalValues();
         int newCount = 0;
         for (ItemKey key : finalValues.keySet()) {

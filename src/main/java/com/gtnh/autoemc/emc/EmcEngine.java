@@ -70,6 +70,21 @@ public final class EmcEngine {
     private final Map<ItemKey, List<Pick>> pickedOptions = new HashMap<>();
     /** 按"同级平均"定价的假电路板(无产出配方,非 producers 成员;最终值同样要注册) */
     private final Set<ItemKey> circuitAveraged = new HashSet<>();
+    /**
+     * "派生值"物品:价不由配方决定、而是从另一个物品(基准形态)的价派生出来的 ——
+     * 份量形态(小堆粉/小撮粉/粒/螺栓/螺丝)与"无配方的粉兜底折算成锭价"。
+     *
+     * 求值期间这些值**不写 known**:每次都按当前基准价现算。否则会留下"按中途基数算出来的
+     * 旧派生值"再也不刷新(实测:粉中途是 12800 时算出小堆粉 3200,粉最终 204800,小堆粉却
+     * 一直停在 3200)。全部求值/补偿/镜像轮次结束后由 materializeDerived() 按最终基准价统一落表。
+     */
+    private final Set<ItemKey> derivedKeys = new HashSet<>();
+    /**
+     * 被"材料等价形态族"折叠掉的形态(锭/热锭/粉/小堆粉/小撮粉/粒/杆/螺栓/螺丝 里,
+     * 不是族基准单价的那些):价 = 族单价 × 材料量比,不再展开自己的配方。
+     * 它们在配方树里当"规则叶子"(isDefinedLeaf),链被剪掉 —— 即"到锭/粉就不再往下展开"。
+     */
+    private final Set<ItemKey> foldedForms = new HashSet<>();
     /** GTMoreEMC mass-seeding:GT material forms priced directly (mass*72*form multiplier). */
     private final Map<ItemKey, BigInteger> seeded = new HashMap<>();
     /**
@@ -211,16 +226,16 @@ public final class EmcEngine {
             known.put(key, v);
             return v;
         }
-        // 份量形态(粉/小撮粉/小堆粉/粒/螺栓/螺丝):直接按材料份量折算,不展开配方,
-        // 结果缓存到 known 复用(最大的粉=锭、螺栓/螺丝=杆/2)。
+        // 份量形态(小撮粉/小堆粉/粒/螺栓/螺丝):按材料份量比折算到基准形态,
+        // 不展开自己的配方(小撮粉=粉/9、小堆粉=粉/4、粒=锭/9、螺栓/螺丝=杆/2)。
+        // 满粉不在此列:粉有自己的配方(化学反应釜等),由下面的 producers 比价决定。
         if (GtMachines.isFractionForm(key)) {
-            // 折算不可用(null)与原来的 0 等价:缓存 0,由 resolveDeferred 第二遍重估
-            BigInteger v = GtMachines.materialFractionValue(key, this, stack);
-            if (v == null) {
-                v = BigInteger.ZERO;
-            }
-            known.put(key, v);
-            return v;
+            // 派生值:按当前基准价现算、**不缓存**(基准价在后续轮次里还会变),
+            // 由 materializeDerived() 在收尾时按最终基准价落表。
+            // 基准还没定价时返回"未知"且不缓存 —— 0 在成本里等于免费,会让
+            // "4 小堆粉 = 1 粉"这类份量恒等式以 0 成本胜出,把基准价钉死。
+            derivedKeys.add(key);
+            return GtMachines.materialFractionValue(key, this, stack);
         }
         List<EmcRecipe> list = producers.get(key);
         if (list == null || list.isEmpty()) {
@@ -230,6 +245,12 @@ public final class EmcEngine {
             // 同等级电路板总价/数量,只对无价成员生效)。共享当前栈以保留环检测
             // (假电路之间互相求平均的环返回未知(null))。
             BigInteger v = GtMachines.materialFractionValue(key, this, stack);
+            if (GtMachines.fractionBaseKey(key) != null) {
+                // 无产出配方、但有份量基准(如没有配方的粉兜底折算成锭价):同样按派生值处理 ——
+                // 不缓存、由 materializeDerived() 收尾落表;基准未定价时返回"未知"不缓存。
+                derivedKeys.add(key);
+                return v;
+            }
             if (!EmcMath.isPositive(v) && GtMachines.isCircuitBoardKey(key)) {
                 if (stack.contains(key)) {
                     return null;
@@ -261,6 +282,8 @@ public final class EmcEngine {
         boolean bestPositive = false;
         boolean bestFreeInput = false;
         List<Pick> bestPicks = null;
+        // 无尽类物品(Avaritia / avaritiaddons 命名空间):只要候选里有无尽工作台配方就优先它
+        boolean avaritiaItem = AvaritiaRecipes.isAvaritiaItem(key);
         // 透镜专用:若存在有效的车床 板->透镜 配方,优先选它(规则:透镜优先按车床板配方定价,
         // 压过精宝石/切割等其他产法);不存在时退回常规选择。
         boolean lensOutput = GtMachines.isLensKey(key);
@@ -270,7 +293,23 @@ public final class EmcEngine {
         boolean latheFreeInput = false;
         List<Pick> lathePicks = null;
         List<Pick> tmpPicks = new ArrayList<>();
+        // 同材料等价形态自推(锭↔粉↔热锭、粉↔小堆粉…):成本恒等于本材料自身的价,参与比价
+        // 就是把价钉死成"谁先求值谁定值"(实测 粉=锭=4×热锭 的任意定点)。仅当该物品存在
+        // "独立产线"(至少一条不吃同材料形态的候选)时才屏蔽这些边;否则整个材料族一个价都
+        // 没有,退回老行为(纯环材料仍按老办法打破环)。
+        boolean blockSelfForm = false;
+        if (GtMachines.isMaterialForm(key)) {
+            for (EmcRecipe r : list) {
+                if (!onlySameMaterialForms(r, key)) {
+                    blockSelfForm = true;
+                    break;
+                }
+            }
+        }
         for (EmcRecipe r : list) {
+            if (blockSelfForm && onlySameMaterialForms(r, key)) {
+                continue; // 同材料形态自推:不参与比价,等价关系由 materializeMaterialFamilies 统一给
+            }
             tmpPicks.clear();
             BigInteger cost = costOf(r, stack, tmpPicks);
             if (cost == null) {
@@ -295,6 +334,10 @@ public final class EmcEngine {
                 take = true;
             } else if (freeInput && !bestFreeInput) {
                 take = false;
+            } else if (avaritiaItem && r.isAvaritiaTable() != best.isAvaritiaTable()) {
+                // 无尽类物品:无尽工作台(大工作台)配方优先,压过中子素压缩机等机器路径、
+                // 普通合成台路径与成本比较(规则:无尽类用自己的合成台)。
+                take = r.isAvaritiaTable();
             } else {
                 take = better(r, unitCost, best, bestUnitCost);
             }
@@ -539,8 +582,27 @@ public final class EmcEngine {
         return false;
     }
 
+    /**
+     * 恒等式防线:opt 是否是"本次求值目标 self 的更小份量形态"(4 小堆粉=1 粉、9 粒=1 锭…)。
+     * 同份量的形态不算:粉->锭(熔炼)、锭->粉(粉碎)是真实产线,只挡更小份量的重组配方。
+     */
+    private boolean isSelfFractionInput(ItemKey opt, ItemKey self) {
+        if (self == null || opt == null || opt.equals(self)) {
+            return false;
+        }
+        ItemKey base = GtMachines.fractionBaseKey(opt);
+        if (base == null || !base.equals(self)) {
+            return false;
+        }
+        long optAmount = GtMachines.materialAmount(opt);
+        long selfAmount = GtMachines.materialAmount(self);
+        return optAmount > 0 && selfAmount > 0 && optAmount < selfAmount;
+    }
+
     private BigInteger costOf(EmcRecipe r, Deque<ItemKey> stack, List<Pick> outPicks) {
         BigInteger sum = BigInteger.ZERO;
+        // 栈顶 = 本次正在求值的目标物品,用于恒等式防线
+        ItemKey self = stack.peekLast();
         for (EmcIngredient ing : r.inputs) {
             BigInteger bestPriced = null;
             ItemKey bestPricedKey = null;
@@ -548,6 +610,12 @@ public final class EmcEngine {
             ItemKey bestFreeKey = null;
             boolean anyOption = false;
             for (ItemKey opt : ing.options) {
+                if (isSelfFractionInput(opt, self)) {
+                    // 拿"由目标物品自己折算出来的更小份量形态"当原料(4 小堆粉 = 1 粉、
+                    // 9 小撮粉 = 1 粉、9 粒 = 1 锭 之类):成本恒等于目标物品本身,是恒等式
+                    // 而非信息。让它参与比价只会把价钉死成旧值(锭->粉->小堆粉->粉 死循环)。
+                    continue;
+                }
                 BigInteger v = eval(opt, stack);
                 if (v == null) {
                     continue; // 该选项正处在当前递归环上,换下一个选项
@@ -938,7 +1006,7 @@ public final class EmcEngine {
 
     /** 该 key 是否为规则直接定价的叶子(质量种子 / 同级平均电路板):价不来自配方,树不展开其配方链 */
     public boolean isDefinedLeaf(ItemKey key) {
-        return seeded.containsKey(key) || circuitAveraged.contains(key);
+        return seeded.containsKey(key) || circuitAveraged.contains(key) || foldedForms.contains(key);
     }
 
     /** 该 key 是否本次按同级电路板平均定价(CSV/展示用) */
@@ -975,6 +1043,124 @@ public final class EmcEngine {
 
     public int sizeOfKnown() {
         return known.size();
+    }
+
+    /**
+     * 候选是否"只吃本材料的等价形态"(锭↔粉↔热锭↔小堆粉…)。没有物品输入(纯流体/工具)不算。
+     */
+    private boolean onlySameMaterialForms(EmcRecipe r, ItemKey output) {
+        if (r == null || r.inputs == null || r.inputs.isEmpty()) {
+            return false;
+        }
+        for (EmcIngredient ing : r.inputs) {
+            if (ing.options == null || ing.options.isEmpty()) {
+                return false;
+            }
+            for (ItemKey opt : ing.options) {
+                if (!GtMachines.sameMaterial(output, opt)) {
+                    return false; // 有一条选项是别的材料 ⇒ 不是同材料自推
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 材料"等价形态族"收尾:锭/热锭/粉/小堆粉/小撮粉/粒/杆/螺栓/螺丝 按 GT 材料量比
+     * (ingot=ingotHot=dust=M、dustSmall=M/4、dustTiny=nugget=M/9、stick=M/2、bolt=screw=M/8)
+     * 视作同一材料的等价形态 —— 族内只留"最便宜的独立产线单价",其余形态 = 单价 × 材料量比,
+     * 不再展开自己的配方(树里当规则叶子,链被剪掉):即"到锭/粉就不再往下展开"。
+     *
+     * 这一步让族内价**与求值顺序无关**,不再出现"粉=锭、锭=4×热锭、热锭=粉/4"这类互相钉死的
+     * 任意定点(实测先落 3070、后落 204800 都是这么来的)。返回被重写的条目数。
+     */
+    public int materializeMaterialFamilies() {
+        Map<Object, List<ItemKey>> byMaterial = new HashMap<>();
+        List<ItemKey> seen = new ArrayList<>(known.keySet());
+        seen.addAll(derivedKeys);
+        for (ItemKey k : seen) {
+            if (!GtMachines.isMaterialForm(k)) {
+                continue;
+            }
+            Object material = GtMachines.materialIdentity(k);
+            if (material == null) {
+                continue;
+            }
+            byMaterial.computeIfAbsent(material, m -> new ArrayList<>());
+        }
+        int written = 0;
+        for (Object material : new ArrayList<>(byMaterial.keySet())) {
+            List<ItemKey> members = GtMachines.materialFormKeys(material);
+            // 族基准 = 族内"值/材料量"最小者(最便宜的独立产线)
+            ItemKey baseKey = null;
+            BigInteger baseValue = null;
+            long baseAmount = 0L;
+            for (ItemKey k : members) {
+                BigInteger v = known.get(k);
+                long amt = GtMachines.materialAmount(k);
+                if (!EmcMath.isPositive(v) || amt <= 0) {
+                    continue;
+                }
+                if (baseKey == null || EmcMath.cmp(EmcMath.mul(v, baseAmount), EmcMath.mul(baseValue, amt)) < 0) {
+                    baseKey = k;
+                    baseValue = v;
+                    baseAmount = amt;
+                }
+            }
+            if (baseKey == null) {
+                continue; // 族内没有任何独立产线价:保持原样(纯环材料仍按老办法破环)
+            }
+            for (ItemKey k : members) {
+                long amt = GtMachines.materialAmount(k);
+                if (amt <= 0) {
+                    continue;
+                }
+                BigInteger v = EmcMath.div(EmcMath.mul(baseValue, amt), baseAmount);
+                BigInteger old = known.get(k);
+                if (old == null || EmcMath.cmp(old, v) != 0) {
+                    known.put(k, v);
+                    written++;
+                }
+                if (k.equals(baseKey)) {
+                    foldedForms.remove(k); // 基准形态保留自己的独立配方(树里能看到它怎么来)
+                } else {
+                    foldedForms.add(k);
+                    chosen.remove(k);
+                    pickedOptions.remove(k);
+                }
+            }
+        }
+        return written;
+    }
+
+    /**
+     * 收尾:把派生值(份量折算形态、无配方粉的兜底折算)**按最终基准价**重算并落 known。
+     * 必须在所有求值/补偿/镜像轮次之后、collectFinalValues() 之前调用 —— 派生值只在这是终值,
+     * 中途任何轮次里基数变了都不该被它们记下来(否则小堆粉永远停在"粉还是 12800 时"的 3200)。
+     * 返回被(重新)落表的条目数。
+     */
+    public int materializeDerived() {
+        int written = 0;
+        // 派生链最长 2 层(份量形态->基准形态;真环在上面的求值里已被切断),两轮足够收敛
+        for (int round = 0; round < 2; round++) {
+            int changedNow = 0;
+            for (ItemKey key : new ArrayList<>(derivedKeys)) {
+                BigInteger v = GtMachines.materialFractionValue(key, this, new ArrayDeque<>());
+                if (v == null) {
+                    continue; // 基准始终不可得(真环/基准无价):保持无值,不注册
+                }
+                BigInteger old = known.get(key);
+                if (old == null || EmcMath.cmp(old, v) != 0) {
+                    known.put(key, v);
+                    written++;
+                    changedNow++;
+                }
+            }
+            if (changedNow == 0) {
+                break;
+            }
+        }
+        return written;
     }
 
     /**

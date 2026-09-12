@@ -46,6 +46,15 @@ public final class EmcRecipe {
             .contains("assembl");
     }
 
+    /**
+     * 无尽工作台(Avaritia 大工作台 / Extreme Crafting Table)配方。
+     * 无尽类物品(Avaritia / avaritiaddons 命名空间)同时存在大工作台配方时优先选它 ——
+     * 压过中子素压缩机等机器路径与普通合成台路径(见 EmcEngine.eval 的选择链)。
+     */
+    public boolean isAvaritiaTable() {
+        return "avaritia".equals(source);
+    }
+
     /** 无流体输入的构造(工作台/熔炉/大工作台)。 */
     public EmcRecipe(ItemKey output, int outputQty, List<EmcIngredient> inputs, int category, int tier, String source,
         int formRank, int fluidAmount) {

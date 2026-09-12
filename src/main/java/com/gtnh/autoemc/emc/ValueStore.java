@@ -34,8 +34,15 @@ import com.gtnh.autoemc.api.recipe.RecipeSource;
  */
 public final class ValueStore {
 
-    /** 公式语义版本:改了求值规则就 +1,强制全量重算(24:EMC 值域 int -> BigInteger,旧的被夹取缓存失效) */
-    public static final int FORMULA_VERSION = 24;
+    /**
+     * 公式语义版本:改了求值规则就 +1,强制全量重算。
+     * 24:EMC 值域 int -> BigInteger(旧夹取缓存失效)。
+     * 25:满粉不再走份量折算、份量待定不再缓存 0、份量恒等式配方不参与比价(修 锭-粉-小堆粉 死循环)。
+     * 26:无尽类物品优先无尽工作台配方。
+     * 27:材料等价形态族(锭/热锭/粉/小堆粉/小撮粉/粒/杆/螺栓/螺丝)统一按 GT 材料量比取族内最低单价,
+     * 同材料形态不再互推配方(消除"粉=锭=4×热锭"的任意定点)。
+     */
+    public static final int FORMULA_VERSION = 27;
     private static final int SCHEMA = 2;
 
     private static final Pattern FINGERPRINT_PATTERN = Pattern.compile("\"fingerprint\"\\s*:\\s*\"([0-9a-f]{16,64})\"");
